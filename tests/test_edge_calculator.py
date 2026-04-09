@@ -227,6 +227,115 @@ class TestComputeEdge:
             assert actual_cost <= result.stake_usd + 0.01, "Cost must not exceed stake budget"
 
 
+# ── Bug regression tests ──────────────────────────────────────────────────────
+
+class TestBugRegressions:
+    """
+    Regression tests for three bugs found in the quadruple audit.
+    These tests would have caught the bugs if they existed earlier.
+    """
+
+    def test_bug1_solve_contracts_no_overrun_when_stake_too_small(self):
+        """
+        BUG: _solve_contracts_with_fee returned n=1 even when
+        1-contract cost (price + fee) > stake, causing a budget overrun.
+
+        stake=0.50, price=0.50: 1 contract costs $0.55 (0.50 + 0.02 fee) > $0.50
+        Should return (0, 0.0) — cannot afford even 1 contract.
+        """
+        from bot.edge_calculator import _solve_contracts_with_fee
+        n, fee = _solve_contracts_with_fee(0.50, 0.50, "")
+        assert n == 0, f"Expected 0 contracts, got {n} (would overrun budget)"
+        assert fee == 0.0
+
+        # Verify the boundary: exactly enough to afford 1 contract
+        from bot.fee_calculator import compute_taker_fee
+        min_stake = 0.50 + compute_taker_fee(0.50, 1)  # = 0.52
+        n2, fee2 = _solve_contracts_with_fee(min_stake, 0.50, "")
+        assert n2 >= 1, f"Should afford 1 contract at exact cost={min_stake:.4f}"
+
+        # Verify cost never exceeds stake for various inputs
+        for stake, price in [(1.0, 0.55), (5.0, 0.30), (50.0, 0.45), (0.30, 0.50)]:
+            n3, fee3 = _solve_contracts_with_fee(stake, price, "")
+            if n3 > 0:
+                cost = n3 * price + fee3
+                assert cost <= stake + 0.005, (
+                    f"Cost {cost:.4f} > stake {stake} for price={price} n={n3}"
+                )
+
+    def test_bug2_min_bet_never_exceeds_balance(self):
+        """
+        BUG: MIN_BET_USD=$1.00 floor was applied regardless of balance,
+        causing a $0.01 balance to produce a $1.00 bet (10,000% of balance).
+
+        Fix: MIN_BET_USD floor only applied when balance >= MIN_BET_USD.
+        """
+        # $0.01 balance — cannot afford MIN_BET_USD=$1.00, should not bet
+        r_tiny = compute_edge(w=0.70, p=0.55, q=0.48, balance=0.01, source_count=3)
+        assert r_tiny.direction == "NONE" or r_tiny.contracts == 0, (
+            f"Balance=$0.01 produced {r_tiny.contracts} contracts — overbet!"
+        )
+
+        # $0.50 balance — still cannot afford 1 contract at 55c (cost=0.57)
+        r_half = compute_edge(w=0.70, p=0.55, q=0.48, balance=0.50, source_count=3)
+        assert r_half.direction == "NONE" or r_half.contracts == 0, (
+            f"Balance=$0.50 produced bet — would overrun balance"
+        )
+
+        # $1.00 balance — exactly at MIN_BET_USD, can afford 1 contract at low price
+        r_one = compute_edge(w=0.70, p=0.40, q=0.35, balance=1.00, source_count=3)
+        # stake = max(kelly, MIN_BET_USD=1.00) = 1.00; 1 contract at 0.40 + fee ≤ 1.00
+        if r_one.direction != "NONE":
+            assert r_one.stake_usd <= 1.00 + 0.01, (
+                f"$1.00 balance bet ${r_one.stake_usd:.4f} — exceeds balance"
+            )
+
+        # Normal balance — MIN_BET_USD floor should apply as before
+        r_normal = compute_edge(w=0.70, p=0.55, q=0.48, balance=1000.0, source_count=3)
+        assert r_normal.direction == "YES"
+        assert r_normal.contracts >= 1
+
+    def test_bug3_extract_fees_called_in_live_order(self):
+        """
+        BUG: _extract_fees_from_order was defined but never called inside
+        _execute_live_order, making actual maker/taker fee tracking dead code.
+        FillResult.actual_taker_fee was always None for live orders.
+
+        Fix: call _extract_fees_from_order on filled/cancelled/timeout status.
+        """
+        import inspect
+        from bot.executor import _execute_live_order, _extract_fees_from_order
+
+        src = inspect.getsource(_execute_live_order)
+        assert "_extract_fees_from_order" in src, (
+            "_extract_fees_from_order must be called inside _execute_live_order"
+        )
+        # Should be called at least twice: on 'filled' and on timeout path
+        count = src.count("_extract_fees_from_order")
+        assert count >= 2, (
+            f"_extract_fees_from_order called {count}x — need at least filled + timeout"
+        )
+
+        # Verify _extract_fees_from_order parses fee fields correctly
+        taker, maker = _extract_fees_from_order({
+            "taker_fees_dollars": "0.1800",
+            "maker_fees_dollars": "0.0000",
+        })
+        assert taker == pytest.approx(0.18)
+        assert maker is None  # 0.00 → None
+
+        taker2, maker2 = _extract_fees_from_order({
+            "taker_fees_dollars": "0.0000",
+            "maker_fees_dollars": "0.0450",
+        })
+        assert taker2 is None   # taker=0 means it was a maker fill
+        assert maker2 == pytest.approx(0.045)
+
+        # Empty response returns None, None
+        t3, m3 = _extract_fees_from_order(None)
+        assert t3 is None and m3 is None
+
+
 # ── Adaptive MIN_EDGE ─────────────────────────────────────────────────────────
 
 class TestAdaptiveMinEdge:

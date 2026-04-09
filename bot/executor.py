@@ -108,9 +108,17 @@ async def _execute_live_order(
         except (TypeError, ValueError):
             pass
         if s == "filled":
-            return FillResult(True, filled_contracts, False, order_id, client_order_id)
+            # BUG FIX: extract actual maker/taker fees from the final filled order.
+            # _extract_fees_from_order was defined but never called — fee data was
+            # always None, making the maker-vs-taker tracking feature dead code.
+            taker_fee, maker_fee = _extract_fees_from_order(status)
+            return FillResult(True, filled_contracts, False, order_id, client_order_id,
+                              actual_taker_fee=taker_fee, actual_maker_fee=maker_fee)
         if s in ("canceled", "cancelled"):
-            return FillResult(filled_contracts > 0, filled_contracts, filled_contracts > 0, order_id, client_order_id)
+            taker_fee, maker_fee = _extract_fees_from_order(status)
+            return FillResult(filled_contracts > 0, filled_contracts, filled_contracts > 0,
+                              order_id, client_order_id,
+                              actual_taker_fee=taker_fee, actual_maker_fee=maker_fee)
 
     # Timeout — cancel remainder
     _log.warning("Order %s timed out. Cancelling.", order_id)
@@ -124,7 +132,9 @@ async def _execute_live_order(
 
     if filled_contracts == 0:
         return FillResult(False, 0.0, False, order_id, client_order_id)
-    return FillResult(True, filled_contracts, True, order_id, client_order_id)
+    taker_fee, maker_fee = _extract_fees_from_order(final)
+    return FillResult(True, filled_contracts, True, order_id, client_order_id,
+                      actual_taker_fee=taker_fee, actual_maker_fee=maker_fee)
 
 
 def _extract_fees_from_order(order_status: Optional[dict]) -> tuple[Optional[float], Optional[float]]:

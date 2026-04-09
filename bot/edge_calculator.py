@@ -146,9 +146,10 @@ def _solve_contracts_with_fee(
     Solve for the largest contract count where contracts*price + fee ≤ stake.
 
     Uses iterative refinement to handle the fee circular dependency:
-      1. Estimate fee for floor(stake/price) contracts.
-      2. Reduce budget by fee, recompute contracts.
-      3. Repeat until stable (converges in 2-3 iterations).
+      1. Check if even 1 contract is affordable (early exit if not).
+      2. Estimate fee for floor(stake/price) contracts.
+      3. Reduce budget by fee, recompute contracts.
+      4. Repeat until stable (converges in 2-3 iterations).
 
     Returns:
         (num_contracts, actual_fee)
@@ -156,16 +157,19 @@ def _solve_contracts_with_fee(
     if price <= 0 or stake <= 0:
         return 0, 0.0
 
+    # BUG FIX: Always check whether even 1 contract is affordable before proceeding.
+    # Without this check, the function returns n=1 even when 1*price + fee > stake,
+    # causing the caller to commit more than the intended budget.
+    fee_1 = fee_calculator.compute_taker_fee(price, 1, ticker)
+    if price + fee_1 > stake + 0.005:   # 0.5c tolerance for float rounding
+        return 0, 0.0
+
     n = max(1, math.floor(stake / price))
     for _ in range(max_iter):
         fee = fee_calculator.compute_taker_fee(price, n, ticker)
         budget_after_fee = stake - fee
         if budget_after_fee <= 0:
-            # Fee exceeds entire stake — bet only 1 contract
-            fee_1 = fee_calculator.compute_taker_fee(price, 1, ticker)
-            if 1 * price + fee_1 <= stake + 0.005:  # 0.5c tolerance
-                return 1, fee_1
-            return 0, 0.0
+            return 1, fee_1   # Already verified 1 contract is affordable above
         n_new = max(1, math.floor(budget_after_fee / price))
         if n_new == n:
             break
@@ -205,7 +209,12 @@ def _compute_side(
     adjusted_kelly = kelly_f * uncertainty_mult * time_decay_mult
     raw_stake = config.KELLY_FRACTION * adjusted_kelly * balance
     stake = min(raw_stake, config.MAX_BET_PCT * balance)
-    stake = max(stake, config.MIN_BET_USD)
+    # BUG FIX: MIN_BET_USD floor must NEVER exceed actual balance.
+    # Without this guard, a $0.01 balance with MIN_BET_USD=$1.00 produces a
+    # 10,000% overbet. Only apply the floor if balance can support it.
+    if balance >= config.MIN_BET_USD:
+        stake = max(stake, config.MIN_BET_USD)
+    # else: leave stake unclamped — _solve_contracts will return 0 if unaffordable
 
     # Fee-aware contract sizing (fixes circular dependency)
     contracts, fee = _solve_contracts_with_fee(stake, exec_price, ticker)
