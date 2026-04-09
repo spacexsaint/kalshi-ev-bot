@@ -4,7 +4,7 @@ test_risk_manager.py — Unit tests for upgraded risk_manager.py
 Tests:
   - can_trade() now returns (bool, reason) tuple
   - Correlation-aware position limiting
-  - Category detection
+  - Category detection (including NASDAQ)
   - Circuit breaker, position cap, daily reset
 """
 
@@ -374,3 +374,73 @@ class TestEarlyPnlWarning:
         rm._pnl_warning_sent = True
         rm.reset_daily(1000.0)
         assert rm._pnl_warning_sent is False
+
+
+# ── NASDAQ correlation detection (Agent B fix) ───────────────────────────────
+
+class TestNasdaqCorrelation:
+    """
+    Regression: NASDAQ index markets like "NASDAQ >19000" and "NASDAQ >19500"
+    must be detected as the same category so correlation limits apply.
+    Without this, the bot could open unlimited correlated NASDAQ positions.
+    """
+
+    def test_nasdaq_detected_as_category(self):
+        from bot.risk_manager import get_position_category
+        assert get_position_category("Will NASDAQ close above 19000?") == "nasdaq"
+
+    def test_nasdaq100_detected(self):
+        from bot.risk_manager import get_position_category
+        assert get_position_category("NASDAQ100 above 20000 today") == "nasdaq"
+
+    def test_two_nasdaq_markets_correlated(self):
+        """Two NASDAQ markets at different strikes must share the same category."""
+        from bot.risk_manager import get_position_category
+        cat1 = get_position_category("NASDAQ >19000")
+        cat2 = get_position_category("NASDAQ >19500")
+        assert cat1 == cat2
+        assert cat1 == "nasdaq"
+
+    def test_nasdaq_blocked_at_max(self):
+        """NASDAQ positions at MAX_POSITIONS_PER_CATEGORY must be blocked."""
+        from bot.risk_manager import get_correlation_stake_multiplier
+        import bot.state_manager as sm
+        sm._state["open_positions"] = [
+            {
+                "ticker": f"NASDAQ100-{i}",
+                "market_title": f"NASDAQ above {19000 + i * 500}",
+                "category": "nasdaq",
+                "direction": "YES",
+                "entry_price_cents": 50,
+                "contracts": 10.0,
+                "stake_usd": 50.0,
+                "fair_prob_at_entry": 0.60,
+                "net_edge_at_entry": 0.08,
+                "opened_at": "2026-04-08T12:00:00+00:00",
+                "client_order_id": f"uuid-nasdaq-{i}",
+            }
+            for i in range(config.MAX_POSITIONS_PER_CATEGORY)
+        ]
+        mult, cat = get_correlation_stake_multiplier("NASDAQ above 20500")
+        assert mult == 0.0
+        assert cat == "nasdaq"
+
+
+# ── Emergency 5xx pause (Agent B fix) ────────────────────────────────────────
+
+class TestEmergency5xxPause:
+    """
+    Regression: kalshi_client must track consecutive 5xx errors and
+    expose the counter for risk management.
+    """
+
+    def test_consecutive_5xx_counter_exists(self):
+        from bot.kalshi_client import get_consecutive_5xx, reset_consecutive_5xx
+        reset_consecutive_5xx()
+        assert get_consecutive_5xx() == 0
+
+    def test_reset_clears_counter(self):
+        import bot.kalshi_client as kc
+        kc._consecutive_5xx = 5
+        kc.reset_consecutive_5xx()
+        assert kc._consecutive_5xx == 0

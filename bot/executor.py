@@ -344,7 +344,37 @@ async def place_arb_pair(
     yes_coid = str(uuid.uuid4())
     no_coid = str(uuid.uuid4())
     yes_fill = await _execute_live_order(client, ticker, "yes", yes_cents, n_contracts, yes_coid)
+
+    # Rollback: if YES leg fails, don't attempt NO leg
+    if not yes_fill.success or yes_fill.filled_contracts == 0:
+        _log.warning("ARB ABORT: YES leg failed for %s. Skipping NO leg.", ticker)
+        await _send_discord(
+            session,
+            f"🔷⚠️ **PURE ARB FAILED** `LIVE`\n"
+            f"**{ticker}** | YES leg failed — NO leg not attempted.",
+        )
+        return yes_fill, None
+
     no_fill = await _execute_live_order(client, ticker, "no", no_cents, n_contracts, no_coid)
+
+    # Rollback: if NO leg fails after YES succeeded, sell YES to unwind
+    if not no_fill.success or no_fill.filled_contracts == 0:
+        _log.error(
+            "ARB PARTIAL FILL: YES filled %.0f but NO failed for %s. Unwinding YES.",
+            yes_fill.filled_contracts, ticker,
+        )
+        unwind_coid = str(uuid.uuid4())
+        await _execute_live_order(
+            client, ticker, "yes", yes_cents,
+            int(yes_fill.filled_contracts), unwind_coid, action="sell",
+        )
+        await _send_discord(
+            session,
+            f"🔷🚨 **ARB ROLLBACK** `LIVE`\n"
+            f"**{ticker}** | YES filled but NO failed — sold YES to unwind.\n"
+            f"YES contracts unwound: {yes_fill.filled_contracts:.0f}",
+        )
+        return yes_fill, no_fill
 
     await _send_discord(
         session,
