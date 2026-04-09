@@ -1,15 +1,33 @@
 """
 risk_manager.py — Circuit breakers, position limits, daily loss guard.
 
-State is loaded from state_manager at startup.
-All checks are synchronous (called from the async main loop via run_in_executor
-or directly — they're fast enough to be non-blocking in practice).
+═══════════════════════════════════════════════════════════════════
+AUDIT IMPROVEMENTS (2026-04-08):
+═══════════════════════════════════════════════════════════════════
+
+[NEW] Correlation-aware position sizing:
+  If multiple open positions share the same category (e.g., all "Fed rate
+  cut" markets), they are correlated bets. The Kelly criterion assumes
+  independent bets — violating this assumption leads to over-betting.
+
+  Fix: Track open position categories. If a category already has
+  >= MAX_POSITIONS_PER_CATEGORY open positions, block the new bet entirely.
+  If it has exactly 1, apply CORRELATED_BET_SIZE_PENALTY (50% size reduction).
+
+  Source: Galekwa et al. (IEEE ACCESS 2026) — "betting funds with accurate
+  models but no risk management discipline consistently fail."
+
+[IMPROVED] can_trade() now returns a reason string for logging.
+[IMPROVED] get_position_category() for correlation detection.
+═══════════════════════════════════════════════════════════════════
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import re
+from collections import defaultdict
+from typing import Dict, List, Optional, Tuple
 
 from bot import config
 from bot import state_manager
@@ -17,33 +35,100 @@ from bot import logger as bot_logger
 
 _log = logging.getLogger(__name__)
 
-
 # ── Circuit breaker flag ───────────────────────────────────────────────────────
-# Set to True when daily loss limit is hit; cleared only by reset_daily().
 _halted: bool = False
+
+
+# ── Category extraction ────────────────────────────────────────────────────────
+
+# Keywords that identify correlated market categories
+_CATEGORY_PATTERNS: Dict[str, List[str]] = {
+    "fed_rates": ["fed", "federal reserve", "rate cut", "interest rate", "fomc", "powell"],
+    "inflation": ["cpi", "inflation", "pce", "price index"],
+    "unemployment": ["unemployment", "jobless", "nonfarm", "payroll"],
+    "election": ["election", "president", "senate", "congress", "ballot", "vote"],
+    "trump": ["trump", "donald"],
+    "biden": ["biden"],
+    "btc": ["bitcoin", "btc"],
+    "eth": ["ethereum", "eth"],
+    "crypto": ["crypto", "coinbase", "binance"],
+    "nba": ["nba", "basketball", "finals", "lakers", "celtics", "warriors"],
+    "nfl": ["nfl", "football", "super bowl", "chiefs", "eagles"],
+    "mlb": ["mlb", "baseball", "world series"],
+    "sp500": ["s&p", "sp500", "inx", "stock market"],
+    "gdp": ["gdp", "recession", "growth"],
+}
+
+
+def get_position_category(title: str) -> str:
+    """
+    Extract a correlation category from a market title.
+    Returns "uncategorized" if no known category detected.
+    """
+    title_lower = title.lower()
+    for category, keywords in _CATEGORY_PATTERNS.items():
+        if any(kw in title_lower for kw in keywords):
+            return category
+    return "uncategorized"
+
+
+def count_open_positions_in_category(category: str) -> int:
+    """Count how many open positions share the given category."""
+    if category == "uncategorized":
+        return 0   # Don't penalise uncategorised markets
+    count = 0
+    for pos in state_manager.get_open_positions():
+        pos_title = pos.get("ticker", "") + " " + pos.get("direction", "")
+        # Use ticker as a proxy — real category stored when position opened
+        pos_category = pos.get("category", get_position_category(pos.get("market_title", pos.get("ticker", ""))))
+        if pos_category == category:
+            count += 1
+    return count
+
+
+def get_correlation_stake_multiplier(market_title: str) -> Tuple[float, str]:
+    """
+    Return a stake multiplier and category based on correlation risk.
+
+    Returns:
+        (multiplier, category)
+        multiplier = 1.0  → no penalty
+        multiplier = 0.50 → 1 existing correlated position (halve stake)
+        multiplier = 0.0  → blocked (>= MAX_POSITIONS_PER_CATEGORY)
+    """
+    category = get_position_category(market_title)
+    count = count_open_positions_in_category(category)
+
+    if count >= config.MAX_POSITIONS_PER_CATEGORY:
+        return 0.0, category
+    if count == 1:
+        return config.CORRELATED_BET_SIZE_PENALTY, category
+    return 1.0, category
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def can_trade() -> bool:
+def can_trade(market_title: str = "") -> Tuple[bool, str]:
     """
-    Return True if the bot is allowed to open new positions.
+    Return (allowed, reason) for whether the bot can open a new position.
 
     Conditions that return False:
-      1. _halted flag is set (daily loss limit already triggered)
-      2. Daily PnL has crossed the loss threshold
+      1. _halted flag set (daily loss limit already triggered)
+      2. Daily PnL crossed the loss threshold
       3. Open position count >= MAX_OPEN_POSITIONS
-      4. PAPER_MODE is True — wait, paper mode DOES trade (paper trades are simulated)
-         So paper mode does NOT block trading; it just flags orders as paper.
+      4. Correlation block: category already at MAX_POSITIONS_PER_CATEGORY
+
+    Args:
+        market_title: Optional market title for correlation check.
+
+    Returns:
+        (True, "ok") or (False, reason_string)
     """
     global _halted
 
-    # Check if already halted
     if _halted:
-        _log.debug("can_trade → False (circuit breaker active)")
-        return False
+        return False, "circuit_breaker_halted"
 
-    # Check daily loss limit
     daily_pnl = state_manager.get_daily_pnl()
     start_balance = state_manager.get_daily_start_balance()
 
@@ -54,7 +139,7 @@ def can_trade() -> bool:
             loss_pct = abs(daily_pnl / start_balance)
             current_balance = start_balance + daily_pnl
             _log.error(
-                "CIRCUIT BREAKER TRIGGERED: daily PnL=%.2f (%.1f%% loss)",
+                "CIRCUIT BREAKER: daily PnL=%.2f (%.1f%% loss)",
                 daily_pnl, loss_pct * 100,
             )
             bot_logger.log_circuit_breaker(
@@ -63,50 +148,38 @@ def can_trade() -> bool:
                 daily_loss_usd=abs(daily_pnl),
                 daily_loss_pct=loss_pct,
             )
-            return False
+            return False, "daily_loss_limit"
 
-    # Check position cap
     open_count = state_manager.open_position_count()
     if open_count >= config.MAX_OPEN_POSITIONS:
-        _log.debug(
-            "can_trade → False (positions=%d >= max=%d)",
-            open_count, config.MAX_OPEN_POSITIONS,
-        )
-        return False
+        return False, f"position_cap_{open_count}/{config.MAX_OPEN_POSITIONS}"
 
-    return True
+    # Correlation check
+    if market_title:
+        mult, category = get_correlation_stake_multiplier(market_title)
+        if mult == 0.0:
+            return False, f"correlation_block_{category}"
+
+    return True, "ok"
 
 
 def is_halted() -> bool:
-    """Return True if the daily circuit breaker has tripped."""
     return _halted
 
 
 def record_fill(filled_usd: float) -> None:
-    """
-    Record a completed fill (called by executor after order fills).
-    Updates PnL by the staked cost (negative, since we spent money).
-    The actual PnL is reconciled via record_pnl when positions close.
-    """
-    # Staking money reduces "available" balance — track unrealised cost
-    # (This is informational; true PnL only recorded on close.)
     _log.debug("Fill recorded: $%.2f staked", filled_usd)
 
 
 def record_pnl(pnl_usd: float) -> None:
-    """
-    Record realised PnL when a position closes.
-    Positive = profit, negative = loss.
-    """
     state_manager.update_pnl(pnl_usd)
-    _log.info("PnL recorded: %+.2f (daily total: %+.2f)", pnl_usd, state_manager.get_daily_pnl())
+    _log.info(
+        "PnL recorded: %+.2f (daily total: %+.2f)",
+        pnl_usd, state_manager.get_daily_pnl(),
+    )
 
 
 def reset_daily(current_balance_usd: float) -> None:
-    """
-    Reset daily tracking at UTC midnight.
-    Clears the circuit breaker and updates start-of-day balance.
-    """
     global _halted
     _halted = False
     state_manager.reset_daily(current_balance_usd)
@@ -119,15 +192,16 @@ def reset_daily(current_balance_usd: float) -> None:
 
 
 def get_stats() -> dict:
-    """Return current risk stats snapshot."""
     daily_pnl = state_manager.get_daily_pnl()
     start_balance = state_manager.get_daily_start_balance()
     open_count = state_manager.open_position_count()
     daily_pnl_pct = (daily_pnl / start_balance) if start_balance > 0 else 0.0
+    tradeable, reason = can_trade()
 
     return {
         "halted": _halted,
-        "can_trade": can_trade() if not _halted else False,
+        "can_trade": tradeable,
+        "can_trade_reason": reason,
         "daily_pnl_usd": daily_pnl,
         "daily_pnl_pct": daily_pnl_pct,
         "daily_start_balance": start_balance,

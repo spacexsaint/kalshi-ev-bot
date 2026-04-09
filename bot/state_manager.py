@@ -6,12 +6,21 @@ Schema (data/state.json):
   "open_positions": [
     {
       "ticker": str,
+      "market_title": str,           ← NEW: for category detection
+      "category": str,               ← NEW: correlated position detection
       "direction": "YES" | "NO",
       "entry_price_cents": int,
-      "contracts": float,         ← supports partial fills
+      "exec_price_cents": int,       ← NEW: actual execution price (ask)
+      "mid_price_cents": int,        ← NEW: midpoint at entry (for true cost tracking)
+      "contracts": float,
       "stake_usd": float,
       "fair_prob_at_entry": float,
       "net_edge_at_entry": float,
+      "gross_edge_at_entry": float,  ← NEW
+      "source_count": int,           ← NEW: number of sources used
+      "sources": [str],              ← NEW: which sources matched
+      "uncertainty_mult": float,     ← NEW: KL uncertainty penalty applied
+      "time_decay_mult": float,      ← NEW: time-decay penalty applied
       "opened_at": ISO8601,
       "client_order_id": str
     }
@@ -21,8 +30,6 @@ Schema (data/state.json):
   "last_reset_date": "YYYY-MM-DD",
   "match_cache_last_updated": ISO8601
 }
-
-Uses filelock to prevent corruption from concurrent writes.
 """
 
 from __future__ import annotations
@@ -42,8 +49,6 @@ _LOCK_PATH = config.STATE_FILE + ".lock"
 _file_lock = FileLock(_LOCK_PATH, timeout=10)
 
 
-# ── Default state ──────────────────────────────────────────────────────────────
-
 def _default_state() -> dict:
     return {
         "open_positions": [],
@@ -54,29 +59,21 @@ def _default_state() -> dict:
     }
 
 
-# ── Module-level in-memory state (loaded at startup) ──────────────────────────
-
 _state: dict = _default_state()
 
 
-# ── I/O helpers ────────────────────────────────────────────────────────────────
-
 def load() -> None:
-    """Load state from disk into memory. Call once at startup."""
     global _state
     path = config.STATE_FILE
     os.makedirs(os.path.dirname(path), exist_ok=True)
-
     if not os.path.exists(path):
         _state = _default_state()
         save()
         return
-
     try:
         with _file_lock:
             with open(path, "r", encoding="utf-8") as fh:
                 on_disk = json.load(fh)
-        # Merge: use defaults for any missing keys
         merged = _default_state()
         merged.update(on_disk)
         _state = merged
@@ -86,19 +83,16 @@ def load() -> None:
 
 
 def save() -> None:
-    """Persist current in-memory state to disk atomically."""
     path = config.STATE_FILE
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = path + ".tmp"
-
     with _file_lock:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             json.dump(_state, fh, indent=2, default=str)
-        os.replace(tmp_path, path)  # Atomic replace
+        os.replace(tmp_path, path)
 
 
 def get_state() -> dict:
-    """Return a deep copy of current state (read-only snapshot)."""
     return deepcopy(_state)
 
 
@@ -106,23 +100,41 @@ def get_state() -> dict:
 
 def add_position(
     ticker: str,
-    direction: str,              # "YES" | "NO"
+    direction: str,
     entry_price_cents: int,
     contracts: float,
     stake_usd: float,
     fair_prob_at_entry: float,
     net_edge_at_entry: float,
     client_order_id: str,
+    # New fields
+    market_title: str = "",
+    category: str = "uncategorized",
+    exec_price_cents: int = 0,
+    mid_price_cents: int = 0,
+    gross_edge_at_entry: float = 0.0,
+    source_count: int = 1,
+    sources: Optional[List[str]] = None,
+    uncertainty_mult: float = 1.0,
+    time_decay_mult: float = 1.0,
 ) -> None:
-    """Add a new open position and save to disk."""
     position = {
         "ticker": ticker,
+        "market_title": market_title,
+        "category": category,
         "direction": direction,
         "entry_price_cents": entry_price_cents,
+        "exec_price_cents": exec_price_cents or entry_price_cents,
+        "mid_price_cents": mid_price_cents or entry_price_cents,
         "contracts": contracts,
         "stake_usd": stake_usd,
         "fair_prob_at_entry": fair_prob_at_entry,
         "net_edge_at_entry": net_edge_at_entry,
+        "gross_edge_at_entry": gross_edge_at_entry,
+        "source_count": source_count,
+        "sources": sources or [],
+        "uncertainty_mult": uncertainty_mult,
+        "time_decay_mult": time_decay_mult,
         "opened_at": datetime.now(timezone.utc).isoformat(),
         "client_order_id": client_order_id,
     }
@@ -131,12 +143,6 @@ def add_position(
 
 
 def remove_position(client_order_id: str) -> Optional[dict]:
-    """
-    Remove a position by client_order_id.
-
-    Returns:
-        The removed position dict, or None if not found.
-    """
     positions = _state["open_positions"]
     for i, pos in enumerate(positions):
         if pos.get("client_order_id") == client_order_id:
@@ -147,7 +153,6 @@ def remove_position(client_order_id: str) -> Optional[dict]:
 
 
 def remove_position_by_ticker(ticker: str) -> Optional[dict]:
-    """Remove a position by ticker (removes first match)."""
     positions = _state["open_positions"]
     for i, pos in enumerate(positions):
         if pos.get("ticker") == ticker:
@@ -158,12 +163,10 @@ def remove_position_by_ticker(ticker: str) -> Optional[dict]:
 
 
 def get_open_positions() -> List[dict]:
-    """Return a copy of all open positions."""
     return deepcopy(_state["open_positions"])
 
 
 def get_position(ticker: str) -> Optional[dict]:
-    """Find a position by ticker."""
     for pos in _state["open_positions"]:
         if pos.get("ticker") == ticker:
             return deepcopy(pos)
@@ -171,19 +174,16 @@ def get_position(ticker: str) -> Optional[dict]:
 
 
 def open_position_count() -> int:
-    """Return the number of currently open positions."""
     return len(_state["open_positions"])
 
 
 def open_tickers() -> List[str]:
-    """Return list of tickers with open positions."""
     return [p["ticker"] for p in _state["open_positions"]]
 
 
 # ── PnL management ─────────────────────────────────────────────────────────────
 
 def update_pnl(delta_usd: float) -> None:
-    """Add delta to daily PnL and save."""
     _state["daily_pnl"] = _state.get("daily_pnl", 0.0) + delta_usd
     save()
 
@@ -201,14 +201,7 @@ def set_daily_start_balance(balance_usd: float) -> None:
     save()
 
 
-# ── Daily reset ────────────────────────────────────────────────────────────────
-
 def reset_daily(current_balance_usd: float) -> None:
-    """
-    Reset daily tracking. Called at UTC midnight.
-    Sets daily_start_balance to current balance and zeroes PnL.
-    Does NOT clear open positions.
-    """
     today = date.today().isoformat()
     _state["daily_start_balance"] = current_balance_usd
     _state["daily_pnl"] = 0.0
@@ -217,7 +210,6 @@ def reset_daily(current_balance_usd: float) -> None:
 
 
 def needs_daily_reset() -> bool:
-    """Return True if the last reset date is before today (UTC)."""
     last = _state.get("last_reset_date")
     if not last:
         return True
@@ -227,8 +219,6 @@ def needs_daily_reset() -> bool:
 def get_last_reset_date() -> str:
     return _state.get("last_reset_date", "")
 
-
-# ── Match cache metadata ───────────────────────────────────────────────────────
 
 def update_match_cache_ts() -> None:
     _state["match_cache_last_updated"] = datetime.now(timezone.utc).isoformat()
