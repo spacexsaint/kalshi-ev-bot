@@ -122,7 +122,8 @@ def _build_header() -> Panel:
 
     daily_pnl = state_manager.get_daily_pnl()
     pnl_style = "bold green" if daily_pnl >= 0 else "bold red"
-    pnl_str = f"{'+' if daily_pnl >= 0 else ''}\${daily_pnl:.2f}"
+    pnl_sign = "+" if daily_pnl >= 0 else ""
+    pnl_str = f"{pnl_sign}${daily_pnl:.2f}"
 
     win_rate = _compute_win_rate()
     win_str = f"{win_rate:.0%}" if win_rate is not None else "N/A"

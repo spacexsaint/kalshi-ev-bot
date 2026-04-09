@@ -67,32 +67,56 @@ _fetched_at: Optional[float] = None
 _CACHE_TTL_S: float = 290.0
 
 
-# ── HTTP helper ────────────────────────────────────────────────────────────────
+# ── HTTP helper with retry ────────────────────────────────────────────────────
 async def _get_json(
     session: aiohttp.ClientSession,
     url: str,
     params: dict | None = None,
+    max_retries: int = 2,
 ) -> dict | list | None:
-    t0 = time.monotonic()
-    try:
-        async with session.get(
-            url, params=params, timeout=aiohttp.ClientTimeout(total=30)
-        ) as resp:
+    """
+    GET with exponential backoff retry (2 retries: 1s, 2s).
+    A single network blip previously caused an entire source to be silently
+    dropped for the full scan cycle. Retrying recovers transient failures
+    without significantly increasing latency (external sources are non-critical path).
+    """
+    for attempt in range(max_retries + 1):
+        t0 = time.monotonic()
+        try:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                latency_ms = (time.monotonic() - t0) * 1000
+                bot_logger.log_api_call(
+                    method="GET", endpoint=url,
+                    status_code=resp.status,
+                    latency_ms=latency_ms,
+                )
+                if resp.status == 200:
+                    return await resp.json(content_type=None)
+                if resp.status == 429 and attempt < max_retries:
+                    await asyncio.sleep(2.0 ** attempt)
+                    continue
+                _log.warning("HTTP %s from %s (attempt %d)", resp.status, url, attempt + 1)
+                if attempt < max_retries and resp.status >= 500:
+                    await asyncio.sleep(1.0 * (2 ** attempt))
+                    continue
+                return None
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            latency_ms = (time.monotonic() - t0) * 1000
             bot_logger.log_api_call(
-                method="GET", endpoint=url,
-                status_code=resp.status,
-                latency_ms=(time.monotonic() - t0) * 1000,
+                method="GET", endpoint=url, status_code=0,
+                latency_ms=latency_ms, error=str(exc),
             )
-            if resp.status == 200:
-                return await resp.json(content_type=None)
-            _log.warning("HTTP %s from %s", resp.status, url)
+            if attempt < max_retries:
+                wait = 1.0 * (2 ** attempt)
+                _log.warning("Source fetch failed (attempt %d/%d): %s — retrying in %.0fs",
+                             attempt + 1, max_retries + 1, exc, wait)
+                await asyncio.sleep(wait)
+                continue
+            _log.error("Source fetch exhausted retries for %s: %s", url, exc)
             return None
-    except Exception as exc:
-        bot_logger.log_api_call(
-            method="GET", endpoint=url, status_code=0,
-            latency_ms=(time.monotonic() - t0) * 1000, error=str(exc),
-        )
-        return None
+    return None
 
 
 # ── SOURCE 1: PredictIt ────────────────────────────────────────────────────────
