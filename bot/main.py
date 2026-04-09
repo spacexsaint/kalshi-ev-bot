@@ -68,6 +68,13 @@ async def _startup_checks(session: aiohttp.ClientSession, client: KalshiClient) 
     else:
         _log.warning("Kalshi auth failed — running in degraded mode.")
 
+    # Reconcile local state with Kalshi API positions.
+    # If the bot crashed between placing an order and recording the position,
+    # there could be orphan positions on Kalshi with no local tracking.
+    # Detect and log them so the operator can intervene.
+    if results["kalshi"]:
+        await _reconcile_positions(client)
+
     source_status = await fair_value.test_connectivity(session)
     results.update(source_status)
     _log.info(
@@ -77,6 +84,65 @@ async def _startup_checks(session: aiohttp.ClientSession, client: KalshiClient) 
         "OK" if results.get("polymarket") else "FAIL",
     )
     return results
+
+
+async def _reconcile_positions(client: KalshiClient) -> None:
+    """
+    Compare local state positions with Kalshi API positions on startup.
+
+    Logs warnings for:
+    - Orphan positions: on Kalshi but not in local state (crash mid-trade)
+    - Ghost positions: in local state but not on Kalshi (resolved/cancelled while offline)
+
+    Does NOT auto-fix — logging only, so the operator can decide what to do.
+    """
+    try:
+        api_positions = await client.get_positions()
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, OSError) as exc:
+        _log.warning("Position reconciliation failed: %s", exc)
+        return
+
+    api_tickers = set()
+    for pos in api_positions:
+        ticker = pos.get("ticker", "")
+        if ticker:
+            api_tickers.add(ticker)
+
+    local_tickers = set(state_manager.open_tickers())
+
+    # Orphans: on Kalshi but not locally tracked
+    orphans = api_tickers - local_tickers
+    if orphans:
+        _log.warning(
+            "POSITION RECONCILIATION: %d orphan positions on Kalshi not in local state: %s",
+            len(orphans), ", ".join(sorted(orphans)),
+        )
+        bot_logger.log_event(
+            "position_reconciliation",
+            f"Found {len(orphans)} orphan positions on Kalshi: {', '.join(sorted(orphans))}",
+            extra={"orphan_tickers": sorted(orphans)},
+            severity="warning",
+        )
+
+    # Ghosts: in local state but not on Kalshi (resolved/cancelled while offline)
+    ghosts = local_tickers - api_tickers
+    if ghosts:
+        _log.warning(
+            "POSITION RECONCILIATION: %d ghost positions in local state not on Kalshi: %s. "
+            "Removing from local state.",
+            len(ghosts), ", ".join(sorted(ghosts)),
+        )
+        for ghost_ticker in ghosts:
+            state_manager.remove_position_by_ticker(ghost_ticker)
+        bot_logger.log_event(
+            "position_reconciliation",
+            f"Removed {len(ghosts)} ghost positions from local state: {', '.join(sorted(ghosts))}",
+            extra={"ghost_tickers": sorted(ghosts)},
+            severity="warning",
+        )
+
+    if not orphans and not ghosts:
+        _log.info("Position reconciliation: local state matches Kalshi API (%d positions).", len(local_tickers))
 
 
 async def _send_startup_alert(session: aiohttp.ClientSession, balance: Optional[float]) -> None:

@@ -29,6 +29,7 @@ def reset_risk_manager(tmp_path, monkeypatch):
 
     import bot.risk_manager as rm
     rm._halted = False
+    rm._pnl_warning_sent = False
 
     import bot.state_manager as sm
     sm._state = sm._default_state()
@@ -38,6 +39,7 @@ def reset_risk_manager(tmp_path, monkeypatch):
     yield
 
     rm._halted = False
+    rm._pnl_warning_sent = False
 
 
 # ── Category detection tests ───────────────────────────────────────────────────
@@ -325,3 +327,50 @@ class TestGetStats:
         sm._state["open_positions"] = [{"ticker": "X"}, {"ticker": "Y"}]
         stats = rm.get_stats()
         assert stats["open_positions"] == 2
+
+
+# ── Early P&L warning tests (critique cycle 4 fix) ───────────────────────────
+
+class TestEarlyPnlWarning:
+    """
+    Regression: risk_manager must log a warning when daily P&L reaches
+    67% of the circuit breaker threshold, before full halt.
+    """
+
+    def test_warning_flag_exists(self):
+        """risk_manager must track _pnl_warning_sent."""
+        import bot.risk_manager as rm
+        assert hasattr(rm, "_pnl_warning_sent")
+
+    def test_warning_sent_before_halt(self):
+        """
+        At -10% loss (67% of 15% limit), warning should be sent.
+        Trading should still be allowed (not halted).
+        """
+        import bot.risk_manager as rm
+        import bot.state_manager as sm
+        sm._state["daily_start_balance"] = 1000.0
+        sm._state["daily_pnl"] = -101.0  # -10.1% > 67% of 15%=10.05%
+        rm._halted = False
+        rm._pnl_warning_sent = False
+        allowed, reason = rm.can_trade()
+        assert allowed is True, "Trading should still be allowed at -10%"
+        assert rm._pnl_warning_sent is True, "Warning flag should be set"
+
+    def test_warning_not_sent_for_small_loss(self):
+        """Small losses should NOT trigger the early warning."""
+        import bot.risk_manager as rm
+        import bot.state_manager as sm
+        sm._state["daily_start_balance"] = 1000.0
+        sm._state["daily_pnl"] = -50.0  # -5% < 67% of 15%=10%
+        rm._halted = False
+        rm._pnl_warning_sent = False
+        rm.can_trade()
+        assert rm._pnl_warning_sent is False
+
+    def test_warning_reset_on_daily_reset(self):
+        """Daily reset must clear the warning flag."""
+        import bot.risk_manager as rm
+        rm._pnl_warning_sent = True
+        rm.reset_daily(1000.0)
+        assert rm._pnl_warning_sent is False

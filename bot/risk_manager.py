@@ -37,6 +37,7 @@ _log = logging.getLogger(__name__)
 
 # ── Circuit breaker flag ───────────────────────────────────────────────────────
 _halted: bool = False
+_pnl_warning_sent: bool = False  # Track whether early warning has been sent today
 
 
 # ── Category extraction ────────────────────────────────────────────────────────
@@ -128,7 +129,7 @@ def can_trade(market_title: str = "") -> Tuple[bool, str]:
     Returns:
         (True, "ok") or (False, reason_string)
     """
-    global _halted
+    global _halted, _pnl_warning_sent
 
     if _halted:
         return False, "circuit_breaker_halted"
@@ -138,6 +139,25 @@ def can_trade(market_title: str = "") -> Tuple[bool, str]:
 
     if start_balance > 0:
         loss_threshold = -(config.DAILY_LOSS_LIMIT_PCT * start_balance)
+
+        # Early warning at 67% of circuit breaker threshold (once per day).
+        # Alerts operator before full halt so they can intervene.
+        warning_threshold = loss_threshold * 0.67
+        if daily_pnl <= warning_threshold and not _pnl_warning_sent:
+            _pnl_warning_sent = True
+            loss_pct = abs(daily_pnl / start_balance)
+            _log.warning(
+                "PNL WARNING: daily PnL=%.2f (%.1f%% loss) — approaching circuit breaker at %.1f%%",
+                daily_pnl, loss_pct * 100, config.DAILY_LOSS_LIMIT_PCT * 100,
+            )
+            bot_logger.log_event(
+                "pnl_warning",
+                f"Daily P&L warning: {loss_pct:.1%} loss — approaching {config.DAILY_LOSS_LIMIT_PCT:.0%} circuit breaker",
+                extra={"daily_pnl": daily_pnl, "loss_pct": loss_pct,
+                       "warning_threshold": warning_threshold, "halt_threshold": loss_threshold},
+                severity="warning",
+            )
+
         if daily_pnl <= loss_threshold:
             _halted = True
             loss_pct = abs(daily_pnl / start_balance)
@@ -184,8 +204,9 @@ def record_pnl(pnl_usd: float) -> None:
 
 
 def reset_daily(current_balance_usd: float) -> None:
-    global _halted
+    global _halted, _pnl_warning_sent
     _halted = False
+    _pnl_warning_sent = False
     state_manager.reset_daily(current_balance_usd)
     bot_logger.log_event(
         "daily_reset",

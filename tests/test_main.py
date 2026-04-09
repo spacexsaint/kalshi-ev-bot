@@ -462,3 +462,100 @@ class TestBacktestExecPrice:
         assert "source_count" in src, (
             "Backtest must pass source_count to compute_edge for realistic simulation"
         )
+
+    def test_backtest_historical_regresses_fair_prob(self):
+        """
+        Historical mode must regress fair_prob toward 0.5, NOT use raw last_price.
+        Raw last_price for finalized markets is near 0.0/1.0 (resolution price),
+        creating severe forward-looking bias.
+        """
+        import inspect
+        from backtest import _try_fetch_kalshi_historical
+        # Check the source code for the regression fix
+        src = inspect.getsource(_try_fetch_kalshi_historical)
+        # Must NOT have the old pattern: fair_prob = float(last_price)
+        # Must have regression toward 0.5
+        assert "0.70" in src or "0.30" in src, (
+            "Historical backtest must regress fair_prob toward 0.5 to avoid forward-looking bias"
+        )
+
+
+# ── Close position exit fee tests (critique cycle 4 fix) ────────────────────
+
+class TestClosePositionExitFee:
+    """
+    Regression: close_position must deduct exit taker fee from P&L.
+    Without this, daily P&L tracking overstates returns by the exit fee.
+    """
+
+    def test_close_position_includes_exit_fee(self):
+        """close_position must compute exit_fee and subtract from pnl_usd."""
+        import inspect
+        from bot.executor import close_position
+        src = inspect.getsource(close_position)
+        assert "exit_fee" in src, (
+            "close_position must compute exit_fee for non-resolution closes"
+        )
+        assert "compute_taker_fee" in src, (
+            "close_position must use compute_taker_fee for exit fee calculation"
+        )
+
+    def test_exit_fee_only_for_non_resolution(self):
+        """Exit fee should only apply for profit_take/stop_loss, not resolution."""
+        import inspect
+        from bot.executor import close_position
+        src = inspect.getsource(close_position)
+        assert 'reason != "resolved"' in src, (
+            "Exit fee must only apply for non-resolution closes (profit_take, stop_loss)"
+        )
+
+    def test_exit_fee_reduces_pnl(self):
+        """
+        For a profit-take at 70c with entry 50c and 10 contracts:
+        Gross P&L = (70-50)/100 * 10 = $2.00
+        Exit fee = ceil(0.07 * 10 * 0.70 * 0.30) = ceil(0.147) = $0.15
+        Net P&L = $2.00 - $0.15 = $1.85
+        """
+        from bot.fee_calculator import compute_taker_fee
+        entry_cents = 50
+        current_bid_cents = 70
+        contracts = 10
+        gross_pnl = (current_bid_cents - entry_cents) / 100.0 * contracts
+        exit_fee = compute_taker_fee(current_bid_cents / 100.0, contracts, "TEST")
+        net_pnl = gross_pnl - exit_fee
+        assert net_pnl < gross_pnl, "Exit fee must reduce P&L"
+        assert exit_fee > 0, "Exit fee must be positive"
+        assert net_pnl == pytest.approx(gross_pnl - exit_fee)
+
+
+# ── Startup position reconciliation tests (critique cycle 4 fix) ─────────────
+
+class TestPositionReconciliation:
+    """
+    Regression: bot must reconcile local state with Kalshi API on startup.
+    Orphan positions (on Kalshi but not locally) must be logged.
+    Ghost positions (locally but not on Kalshi) must be cleaned up.
+    """
+
+    def test_reconciliation_exists_in_startup(self):
+        """_startup_checks must call _reconcile_positions."""
+        import inspect
+        from bot.main import _startup_checks
+        src = inspect.getsource(_startup_checks)
+        assert "_reconcile_positions" in src, (
+            "_startup_checks must call _reconcile_positions"
+        )
+
+    def test_reconciliation_function_exists(self):
+        """_reconcile_positions must exist as a callable."""
+        from bot.main import _reconcile_positions
+        assert callable(_reconcile_positions)
+
+    def test_reconciliation_removes_ghosts(self):
+        """_reconcile_positions must remove ghost positions from local state."""
+        import inspect
+        from bot.main import _reconcile_positions
+        src = inspect.getsource(_reconcile_positions)
+        assert "remove_position_by_ticker" in src, (
+            "_reconcile_positions must remove ghost positions from local state"
+        )

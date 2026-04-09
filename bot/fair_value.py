@@ -69,6 +69,12 @@ _fetched_at: Optional[float] = None
 _CACHE_TTL_S: float = 290.0
 _refresh_lock: Optional[asyncio.Lock] = None  # Lazy-init to avoid event loop issues
 
+# Track consecutive fetch failures per source.
+# If a source fails N times in a row, log prominently so operator knows
+# we may be trading on fewer sources than expected.
+_source_fail_counts: Dict[str, int] = {"predictit": 0, "manifold": 0, "polymarket": 0}
+_SOURCE_FAIL_ALERT_THRESHOLD: int = 3  # Log WARNING after this many consecutive failures
+
 
 def _get_refresh_lock() -> asyncio.Lock:
     """Lazy-initialise the asyncio.Lock (must be created inside a running event loop)."""
@@ -76,6 +82,35 @@ def _get_refresh_lock() -> asyncio.Lock:
     if _refresh_lock is None:
         _refresh_lock = asyncio.Lock()
     return _refresh_lock
+
+
+def _track_source_health(source_name: str, candidates: List[Candidate]) -> None:
+    """
+    Track consecutive fetch failures per source.
+
+    If a source returns 0 candidates for _SOURCE_FAIL_ALERT_THRESHOLD consecutive
+    refreshes, log a prominent warning. The operator needs to know we may be
+    trading on fewer sources than expected (degraded confidence).
+    """
+    if candidates:
+        if _source_fail_counts.get(source_name, 0) >= _SOURCE_FAIL_ALERT_THRESHOLD:
+            _log.info("Source %s recovered after %d consecutive failures.", source_name, _source_fail_counts[source_name])
+        _source_fail_counts[source_name] = 0
+    else:
+        _source_fail_counts[source_name] = _source_fail_counts.get(source_name, 0) + 1
+        count = _source_fail_counts[source_name]
+        if count >= _SOURCE_FAIL_ALERT_THRESHOLD:
+            _log.warning(
+                "SOURCE DOWN: %s has returned 0 markets for %d consecutive refreshes. "
+                "Trading may be using fewer sources than expected.",
+                source_name, count,
+            )
+            bot_logger.log_event(
+                "source_failure",
+                f"{source_name} down for {count} consecutive refreshes",
+                extra={"source": source_name, "consecutive_failures": count},
+                severity="warning",
+            )
 
 
 # ── HTTP helper with retry ────────────────────────────────────────────────────
@@ -185,6 +220,15 @@ async def _fetch_manifold(session: aiohttp.ClientSession) -> List[Candidate]:
             prob = m.get("probability")
             if prob is None or m.get("isResolved"):
                 continue
+            try:
+                prob = float(prob)
+            except (TypeError, ValueError):
+                continue
+            # Clip to (0, 1) — raw 0.0 or 1.0 would dominate std calculation
+            # and produce extreme disagreement penalties. PredictIt and Polymarket
+            # already filter strict (0,1); Manifold must match.
+            if not (0.0 < prob < 1.0):
+                continue
             close_dt: Optional[datetime] = None
             ct = m.get("closeTime")
             if ct:
@@ -276,6 +320,12 @@ async def refresh_all_sources(session: aiohttp.ClientSession) -> None:
         _manifold_cache = manifold
         _polymarket_cache = polymarket
         _fetched_at = time.monotonic()
+
+        # Track consecutive failures per source.
+        # Alert operator if a source is down for multiple consecutive cycles.
+        _track_source_health("predictit", predictit)
+        _track_source_health("manifold", manifold)
+        _track_source_health("polymarket", polymarket)
 
 
 def _caches_valid() -> bool:

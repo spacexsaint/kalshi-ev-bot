@@ -378,7 +378,16 @@ async def close_position(
     if resolution_pnl is not None:
         pnl_usd = resolution_pnl
     else:
-        pnl_usd = (current_bid_cents - entry_cents) / 100.0 * contracts
+        # Deduct exit taker fee from P&L for non-resolution closes (profit_take, stop_loss).
+        # When we sell, we pay a taker fee that reduces actual proceeds.
+        # Without this, daily P&L tracking overstates returns by the exit fee amount.
+        from bot.fee_calculator import compute_taker_fee
+        exit_price_decimal = current_bid_cents / 100.0
+        sell_contracts = math.floor(contracts)
+        # Only compute exit fee when we have a valid sell price (0 < price < 1) and contracts to sell
+        can_compute_fee = sell_contracts >= 1 and reason != "resolved" and 0.0 < exit_price_decimal < 1.0
+        exit_fee = compute_taker_fee(exit_price_decimal, sell_contracts, ticker) if can_compute_fee else 0.0
+        pnl_usd = (current_bid_cents - entry_cents) / 100.0 * contracts - exit_fee
 
     try:
         held_s = (datetime.now(timezone.utc) - datetime.fromisoformat(opened_at)).total_seconds()

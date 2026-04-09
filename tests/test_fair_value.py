@@ -124,3 +124,71 @@ class TestSourceDisagreementMult:
         assert _compute_disagreement_mult([0.60, 0.61, 0.60]) == 1.0  # low std
         assert _compute_disagreement_mult([0.60, 0.35, 0.60]) == 0.75  # moderate std
         assert _compute_disagreement_mult([0.60, 0.40, 0.90]) == 0.50  # high std
+
+
+# ── Manifold probability clipping tests (critique cycle 4 fix) ───────────────
+
+class TestManifoldProbabilityClipping:
+    """
+    Regression: Manifold source must clip probabilities to strict (0, 1).
+    Raw 0.0 or 1.0 would dominate the std calculation and create extreme
+    disagreement penalties, distorting the aggregation.
+    """
+
+    def test_manifold_fetch_has_prob_bounds_check(self):
+        """_fetch_manifold must validate probabilities are in (0, 1)."""
+        import inspect
+        from bot.fair_value import _fetch_manifold
+        src = inspect.getsource(_fetch_manifold)
+        assert "0.0 < prob < 1.0" in src, (
+            "_fetch_manifold must clip probabilities to strict (0, 1)"
+        )
+
+    def test_all_three_sources_clip_probabilities(self):
+        """All three source fetchers must validate prob in (0, 1)."""
+        import inspect
+        from bot.fair_value import _fetch_predictit, _fetch_manifold, _fetch_polymarket
+        for fn_name, fn in [("predictit", _fetch_predictit), ("manifold", _fetch_manifold), ("polymarket", _fetch_polymarket)]:
+            src = inspect.getsource(fn)
+            assert "0.0 < " in src or "prob < 1.0" in src, (
+                f"_fetch_{fn_name} must validate probability bounds"
+            )
+
+
+# ── Source health tracking tests (critique cycle 4 fix) ──────────────────────
+
+class TestSourceHealthTracking:
+    """
+    Regression: fair_value must track consecutive fetch failures per source.
+    If a source returns 0 results for 3+ cycles, log a prominent warning.
+    """
+
+    def test_source_fail_counts_exist(self):
+        """Module must have _source_fail_counts dict."""
+        from bot.fair_value import _source_fail_counts
+        assert isinstance(_source_fail_counts, dict)
+        assert "predictit" in _source_fail_counts
+        assert "manifold" in _source_fail_counts
+        assert "polymarket" in _source_fail_counts
+
+    def test_track_source_health_function_exists(self):
+        """_track_source_health must be callable."""
+        from bot.fair_value import _track_source_health
+        assert callable(_track_source_health)
+
+    def test_track_source_health_resets_on_success(self):
+        """Successful fetch resets failure counter to 0."""
+        from bot.fair_value import _track_source_health, _source_fail_counts
+        from bot.market_matcher import Candidate
+        _source_fail_counts["predictit"] = 5
+        _track_source_health("predictit", [Candidate("test", 0.5, None, "predictit", "id")])
+        assert _source_fail_counts["predictit"] == 0
+
+    def test_track_source_health_increments_on_failure(self):
+        """Empty result increments failure counter."""
+        from bot.fair_value import _track_source_health, _source_fail_counts
+        _source_fail_counts["manifold"] = 0
+        _track_source_health("manifold", [])
+        assert _source_fail_counts["manifold"] == 1
+        _track_source_health("manifold", [])
+        assert _source_fail_counts["manifold"] == 2

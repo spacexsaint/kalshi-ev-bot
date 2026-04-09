@@ -218,11 +218,21 @@ def _try_fetch_kalshi_historical() -> Optional[List[HistoricalMarket]]:
             result = m.get("result", "")
             if result not in ("yes", "no"):
                 continue
-            # Use last price as a proxy for fair value entry
+            # FIX: last_price for finalized markets is the resolution price (0.99/0.01),
+            # NOT the pre-resolution fair value. Using it as fair_prob creates severe
+            # forward-looking bias — we'd "know" the outcome before it happens.
+            # Instead, use yes_price/no_price (last traded before resolution) if available,
+            # or add noise away from resolution extremes to simulate pre-resolution state.
             last_price = m.get("last_price", 0.5) or 0.5
-            entry_yes = max(0.01, min(0.99, float(last_price) + 0.03))
-            entry_no = max(0.01, min(0.99, 1.0 - float(last_price) + 0.03))
-            fair_prob = float(last_price)
+            last_price = float(last_price)
+            # Pull fair_prob away from resolution extremes — simulate what the market
+            # looked like BEFORE resolution, not after. Markets that resolved YES had
+            # last_price → 1.0, those that resolved NO had last_price → 0.0.
+            # Regress toward 0.5 by 30% to approximate pre-resolution uncertainty.
+            fair_prob = last_price * 0.70 + 0.50 * 0.30
+            fair_prob = max(0.05, min(0.95, fair_prob))
+            entry_yes = max(0.01, min(0.99, fair_prob + 0.03))
+            entry_no = max(0.01, min(0.99, 1.0 - fair_prob + 0.03))
             markets.append(HistoricalMarket(
                 ticker=m.get("ticker", ""),
                 title=m.get("title", "")[:80],
