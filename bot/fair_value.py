@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional
 
 import aiohttp
+import numpy as np
 
 from bot import config
 from bot import logger as bot_logger
@@ -57,6 +58,7 @@ class FairValue:
     predictit_match_score: Optional[float] = None
     manifold_match_score: Optional[float] = None
     polymarket_match_score: Optional[float] = None
+    source_disagreement_mult: float = 1.0  # 1.0 = no penalty; reduced when sources diverge
 
 
 # ── Module-level caches ────────────────────────────────────────────────────────
@@ -288,12 +290,20 @@ def _aggregate_probabilities(
     manifold_prob: Optional[float],
     polymarket_prob: Optional[float],
     category: str = "uncategorized",
-) -> tuple[float, int, List[str]]:
+) -> tuple[float, int, List[str], float]:
     """
     Weighted aggregation using category-specific calibration weights.
 
     Weights are renormalised to sum to 1.0 over whichever sources matched.
-    Returns: (probability, source_count, source_names)
+    Returns: (probability, source_count, source_names, source_disagreement_mult)
+
+    Source disagreement multiplier:
+      When multiple sources give divergent probabilities, our confidence in
+      the weighted average is lower. We penalise the Kelly fraction to reflect
+      this. Population std of contributing source probabilities:
+        std > 0.20  → mult = 0.50  (severe disagreement, halve Kelly)
+        std > 0.10  → mult = 0.75  (moderate disagreement)
+        else        → mult = 1.00  (sources agree, no penalty)
     """
     available: Dict[str, float] = {}
     if predictit_prob is not None:
@@ -304,7 +314,7 @@ def _aggregate_probabilities(
         available["polymarket"] = polymarket_prob
 
     if not available:
-        return 0.0, 0, []
+        return 0.0, 0, [], 1.0
 
     weight_map = _get_weights_for_category(category)
 
@@ -313,13 +323,33 @@ def _aggregate_probabilities(
     if total_w <= 0:
         # Equal weighting fallback
         prob = sum(available.values()) / len(available)
-        return prob, len(available), list(available.keys())
+        disagreement_mult = _compute_disagreement_mult(list(available.values()))
+        return prob, len(available), list(available.keys()), disagreement_mult
 
     weighted_prob = sum(
         prob * weight_map.get(src, 0.0) / total_w
         for src, prob in available.items()
     )
-    return weighted_prob, len(available), list(available.keys())
+
+    disagreement_mult = _compute_disagreement_mult(list(available.values()))
+    return weighted_prob, len(available), list(available.keys()), disagreement_mult
+
+
+def _compute_disagreement_mult(source_probs: List[float]) -> float:
+    """
+    Compute source disagreement multiplier from individual source probabilities.
+
+    Uses population std (ddof=0) of the contributing source probabilities.
+    Only applies when >=2 sources present; single source gets no penalty.
+    """
+    if len(source_probs) < 2:
+        return 1.0
+    std = float(np.std(source_probs, ddof=0))
+    if std > 0.20:
+        return 0.50
+    if std > 0.10:
+        return 0.75
+    return 1.0
 
 
 # ── Main entry point ───────────────────────────────────────────────────────────
@@ -353,7 +383,7 @@ async def get_fair_value(
     manifold_prob = manifold_match.candidate.probability if manifold_match else None
     polymarket_prob = polymarket_match.candidate.probability if polymarket_match else None
 
-    aggregated, source_count, source_names = _aggregate_probabilities(
+    aggregated, source_count, source_names, disagreement_mult = _aggregate_probabilities(
         predictit_prob, manifold_prob, polymarket_prob, category
     )
 
@@ -387,6 +417,7 @@ async def get_fair_value(
         predictit_match_score=predictit_match.score if predictit_match else None,
         manifold_match_score=manifold_match.score if manifold_match else None,
         polymarket_match_score=polymarket_match.score if polymarket_match else None,
+        source_disagreement_mult=disagreement_mult,
     )
 
 

@@ -292,6 +292,65 @@ async def place_bet(
     return True
 
 
+# ── place_arb_pair ────────────────────────────────────────────────────────────
+async def place_arb_pair(
+    *,
+    ticker: str,
+    yes_ask: float,
+    no_ask: float,
+    n_contracts: int,
+    client: KalshiClient,
+    session: aiohttp.ClientSession,
+) -> tuple[Optional[FillResult], Optional[FillResult]]:
+    """
+    Place a pure arbitrage pair: buy YES and NO simultaneously.
+
+    When yes_ask + no_ask < 1.0, buying both guarantees profit of
+    (1.0 - yes_ask - no_ask) per contract pair regardless of outcome.
+
+    Returns (yes_fill, no_fill).
+    """
+    yes_cents = int(yes_ask * 100)
+    no_cents = int(no_ask * 100)
+    spread = 1.0 - yes_ask - no_ask
+    guaranteed_profit = spread * n_contracts
+
+    _log.info(
+        "PURE ARB: ticker=%s, yes_ask=%.2f, no_ask=%.2f, spread=%.4f, n=%d, guaranteed_profit=%.2f",
+        ticker, yes_ask, no_ask, spread, n_contracts, guaranteed_profit,
+    )
+
+    if config.PAPER_MODE:
+        yes_coid = str(uuid.uuid4())
+        no_coid = str(uuid.uuid4())
+        yes_fill = await _simulate_paper_fill(n_contracts, yes_coid)
+        no_fill = await _simulate_paper_fill(n_contracts, no_coid)
+        await _send_discord(
+            session,
+            f"🔷 **PURE ARB** `PAPER`\n"
+            f"**{ticker}** | YES@{yes_cents}¢ + NO@{no_cents}¢\n"
+            f"Contracts: **{n_contracts}** | Spread: **{spread:.4f}** | "
+            f"Guaranteed Profit: **${guaranteed_profit:.2f}**",
+        )
+        return yes_fill, no_fill
+
+    yes_coid = str(uuid.uuid4())
+    no_coid = str(uuid.uuid4())
+    yes_fill = await _execute_live_order(client, ticker, "yes", yes_cents, n_contracts, yes_coid)
+    no_fill = await _execute_live_order(client, ticker, "no", no_cents, n_contracts, no_coid)
+
+    await _send_discord(
+        session,
+        f"🔷 **PURE ARB** `LIVE`\n"
+        f"**{ticker}** | YES@{yes_cents}¢ + NO@{no_cents}¢\n"
+        f"Contracts: **{n_contracts}** | Spread: **{spread:.4f}** | "
+        f"Guaranteed Profit: **${guaranteed_profit:.2f}**\n"
+        f"YES fill: {'OK' if yes_fill.success else 'FAIL'} | "
+        f"NO fill: {'OK' if no_fill.success else 'FAIL'}",
+    )
+    return yes_fill, no_fill
+
+
 # ── close_position ─────────────────────────────────────────────────────────────
 async def close_position(
     *,

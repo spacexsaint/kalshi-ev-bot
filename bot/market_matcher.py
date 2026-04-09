@@ -31,6 +31,34 @@ from bot import config
 from bot import logger
 
 
+# ── Index cross-match guard ───────────────────────────────────────────────────
+# Financial index keywords that must not be cross-matched.
+# NASDAQ and S&P 500 titles can have fuzzy match score ~0.85 (above threshold 0.75)
+# because they share structural words ("above", "close", year, etc). Using
+# PredictIt's NASDAQ probability to price an S&P market would be completely wrong.
+INDEX_KEYWORDS: Dict[str, List[str]] = {
+    "nasdaq": ["nasdaq", "ndx", "nasdaq100", "nasdaq-100", "qqq"],
+    "sp500": ["s&p", "sp500", "spx", "s&p500", "s&p 500"],
+    "dow": ["dow", "djia", "dow jones"],
+    "russell": ["russell", "rut", "russell2000"],
+    "vix": ["vix", "volatility index"],
+}
+
+
+def _detect_index(title: str) -> Optional[str]:
+    """
+    Detect which financial index a market title refers to, if any.
+
+    Returns the canonical index name (e.g. "nasdaq", "sp500") or None.
+    """
+    lowered = title.lower()
+    for index_name, keywords in INDEX_KEYWORDS.items():
+        for kw in keywords:
+            if kw in lowered:
+                return index_name
+    return None
+
+
 @dataclass
 class Candidate:
     title: str
@@ -193,6 +221,14 @@ def find_match(
         return None
 
     if best_score < config.FUZZY_LOW_CONF_MIN:
+        return None
+
+    # Cross-index guard: reject matches between different financial indices.
+    # NASDAQ vs S&P titles can score ~0.85 due to shared structure words, but
+    # using one index's probability to price another would be completely wrong.
+    idx_a = _detect_index(kalshi_title)
+    idx_b = _detect_index(best_candidate.title)
+    if idx_a is not None and idx_b is not None and idx_a != idx_b:
         return None
 
     match = Match(

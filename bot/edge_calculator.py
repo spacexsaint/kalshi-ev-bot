@@ -188,11 +188,17 @@ def _compute_side(
     time_decay_mult: float,
     ticker: str,
     is_yes: bool,
+    source_disagreement_mult: float = 1.0,
 ) -> tuple[float, float, float, float, int, float, float, float, float]:
     """
     Compute all metrics for one side (YES or NO).
 
     Both Kelly fraction and EV use exec_price (ask) — coherent pricing.
+
+    Source disagreement multiplier reduces Kelly fraction when external sources
+    give divergent probabilities (std > 0.10 or > 0.20). Applied BEFORE the
+    quarter-Kelly fraction so it compounds: e.g., std>0.20 → effective Kelly
+    = 0.25 × 0.50 = 0.125 of full Kelly.
 
     Returns:
         (gross_edge, net_edge, kelly_f, adjusted_kelly, contracts,
@@ -206,7 +212,8 @@ def _compute_side(
     if kelly_f <= 0:
         return 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, exec_price, midpoint
 
-    adjusted_kelly = kelly_f * uncertainty_mult * time_decay_mult
+    # Source disagreement penalty applied before quarter-Kelly (compounds multiplicatively)
+    adjusted_kelly = kelly_f * uncertainty_mult * time_decay_mult * source_disagreement_mult
     raw_stake = config.KELLY_FRACTION * adjusted_kelly * balance
     stake = min(raw_stake, config.MAX_BET_PCT * balance)
     # BUG FIX: MIN_BET_USD floor must NEVER exceed actual balance.
@@ -242,6 +249,7 @@ def compute_edge(
     no_bid: float = 0.0,
     hours_to_close: Optional[float] = None,
     source_count: int = 1,
+    source_disagreement_mult: float = 1.0,
 ) -> EdgeResult:
     """
     Compute optimal bet direction and size.
@@ -250,15 +258,16 @@ def compute_edge(
     Midpoint stored in market_price for display only.
 
     Args:
-        w:              Fair probability (0–1).
-        p:              YES ask price (decimal, 0–1).
-        q:              NO ask price (decimal, 0–1).
-        balance:        Current USD balance.
-        ticker:         Market ticker (INX/NASDAQ100 fee detection).
-        yes_bid:        YES bid (midpoint display only).
-        no_bid:         NO bid (midpoint display only).
-        hours_to_close: For time-decay calculation.
-        source_count:   Number of sources matched (for KL penalty).
+        w:                        Fair probability (0–1).
+        p:                        YES ask price (decimal, 0–1).
+        q:                        NO ask price (decimal, 0–1).
+        balance:                  Current USD balance.
+        ticker:                   Market ticker (INX/NASDAQ100 fee detection).
+        yes_bid:                  YES bid (midpoint display only).
+        no_bid:                   NO bid (midpoint display only).
+        hours_to_close:           For time-decay calculation.
+        source_count:             Number of sources matched (for KL penalty).
+        source_disagreement_mult: Penalty for divergent source probabilities (1.0 = no penalty).
     """
     _validate_probability(w, "fair_prob (w)")
     _validate_probability(p, "yes_price (p)")
@@ -283,12 +292,14 @@ def compute_edge(
         return _no_bet()
 
     # YES side
-    y = _compute_side(w, yes_bid, p, balance, um, td, ticker, is_yes=True)
+    y = _compute_side(w, yes_bid, p, balance, um, td, ticker, is_yes=True,
+                       source_disagreement_mult=source_disagreement_mult)
     yg, yn, yk, ya, yc, yf, yev, yp, ymid = y
     yes_ok = yn >= min_edge and yc >= 1
 
     # NO side
-    n_ = _compute_side(w, no_bid, q, balance, um, td, ticker, is_yes=False)
+    n_ = _compute_side(w, no_bid, q, balance, um, td, ticker, is_yes=False,
+                        source_disagreement_mult=source_disagreement_mult)
     ng, nn, nk, na, nc, nf, nev, np_, nmid = n_
     no_ok = nn >= min_edge and nc >= 1
 

@@ -189,12 +189,19 @@ async def _manage_positions(client: KalshiClient, session: aiohttp.ClientSession
                 )
                 continue
 
-            # Stop-loss: bid dropped STOP_LOSS_CENTS against us
-            # Prevents holding a position to -100% when the market moves hard against us
-            if current_bid_cents <= entry_cents - config.STOP_LOSS_CENTS:
+            # Relative stop-loss: 40% drop from entry OR 20c absolute, whichever is LARGER.
+            # Using max() makes the stop more permissive (less aggressive), which prevents
+            # stopping out low-priced positions on noise.
+            # For entry=20c: relative_stop=12c, absolute_stop=0c, effective_stop=12c.
+            # For entry=80c: relative_stop=48c, absolute_stop=60c, effective_stop=60c.
+            relative_stop_cents = int(entry_cents * (1.0 - config.STOP_LOSS_FRACTION))
+            absolute_stop_cents = entry_cents - config.STOP_LOSS_CENTS
+            stop_price_cents = max(relative_stop_cents, absolute_stop_cents)
+            if current_bid_cents < stop_price_cents:
                 _log.info(
-                    "Stop-loss on %s: entry=%dc, bid=%dc (-%dc)",
-                    ticker, entry_cents, current_bid_cents, entry_cents - current_bid_cents,
+                    "Stop-loss on %s: entry=%dc, bid=%dc, stop=%dc (rel=%dc, abs=%dc)",
+                    ticker, entry_cents, current_bid_cents, stop_price_cents,
+                    relative_stop_cents, absolute_stop_cents,
                 )
                 await executor.close_position(
                     position=pos,
@@ -206,6 +213,54 @@ async def _manage_positions(client: KalshiClient, session: aiohttp.ClientSession
 
         except Exception as exc:
             _log.error("Error managing position %s: %s", ticker, exc)
+
+
+# ── Pure arbitrage ─────────────────────────────────────────────────────────────
+
+async def _place_arb_trade(
+    ticker: str,
+    yes_ask: float,
+    no_ask: float,
+    balance: float,
+    client: KalshiClient,
+    session: aiohttp.ClientSession,
+) -> None:
+    """
+    Place a riskless arbitrage trade: buy both YES and NO when yes_ask + no_ask < 1.0.
+
+    Guaranteed profit per pair = 1.0 - yes_ask - no_ask.
+    Respects MAX_OPEN_POSITIONS risk limit.
+    """
+    # Check position cap
+    tradeable, reason = risk_manager.can_trade()
+    if not tradeable:
+        _log.info("Arb skipped (risk): %s", reason)
+        return
+
+    cost_per_pair = yes_ask + no_ask
+    # Use half of normal max bet sizing since we're buying 2 sides
+    arb_budget = config.MAX_BET_PCT * balance / 2.0
+    n = math.floor(arb_budget / cost_per_pair) if cost_per_pair > 0 else 0
+
+    if n < 1:
+        _log.info("Arb too small: budget=%.2f, cost_per_pair=%.2f", arb_budget, cost_per_pair)
+        return
+
+    spread = 1.0 - cost_per_pair
+    guaranteed_profit = spread * n
+    _log.info(
+        "PURE ARB: ticker=%s, yes_ask=%.2f, no_ask=%.2f, spread=%.4f, n=%d, guaranteed_profit=%.2f",
+        ticker, yes_ask, no_ask, spread, n, guaranteed_profit,
+    )
+
+    await executor.place_arb_pair(
+        ticker=ticker,
+        yes_ask=yes_ask,
+        no_ask=no_ask,
+        n_contracts=n,
+        client=client,
+        session=session,
+    )
 
 
 # ── Phase 2: Market scanning ───────────────────────────────────────────────────
@@ -231,6 +286,18 @@ async def _evaluate_market(
     ob = await client.get_orderbook(ticker)
     if ob is None:
         return None
+
+    # ── Pure arbitrage detection ──────────────────────────────────────────────
+    # If YES_ask + NO_ask < 1.0, buying both sides guarantees riskless profit.
+    # Check BEFORE fair value fetch — arb doesn't need external source data.
+    if ob.yes_ask > 0 and ob.no_ask > 0 and ob.yes_ask + ob.no_ask < 1.0:
+        arb_spread = 1.0 - ob.yes_ask - ob.no_ask
+        _log.info(
+            "ARB DETECTED on %s: yes_ask=%.2f + no_ask=%.2f = %.2f < 1.0, spread=%.4f",
+            ticker, ob.yes_ask, ob.no_ask, ob.yes_ask + ob.no_ask, arb_spread,
+        )
+        await _place_arb_trade(ticker, ob.yes_ask, ob.no_ask, balance, client, session)
+        return None  # Skip normal EV analysis
 
     # Spread filter
     spread = ob.yes_ask - ob.yes_bid
@@ -268,6 +335,7 @@ async def _evaluate_market(
             no_bid=ob.no_bid,
             hours_to_close=hours_to_close,
             source_count=fv.source_count,
+            source_disagreement_mult=fv.source_disagreement_mult,
         )
     except ValueError:
         return None

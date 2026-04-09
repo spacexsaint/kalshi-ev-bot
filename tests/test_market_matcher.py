@@ -27,8 +27,10 @@ from bot.market_matcher import (
     _preprocess,
     _compute_score,
     _dates_compatible,
+    _detect_index,
     find_match,
     invalidate_cache,
+    INDEX_KEYWORDS,
 )
 
 
@@ -327,3 +329,85 @@ class TestFindMatch:
         )
         assert result is not None
         assert "fed" in result.candidate.title.lower() or "rate" in result.candidate.title.lower()
+
+    # ── INDEX CROSS-MATCH GUARD (C13 fix) ─────────────────────────────────
+
+    def test_nasdaq_vs_sp500_rejected(self):
+        """
+        NASDAQ and S&P titles must NOT match, even with high fuzzy score.
+        Different financial indices would cause catastrophically wrong pricing.
+        """
+        candidates = [
+            self._make_candidate("S&P 500 above 5000 December 2026"),
+        ]
+        # Mock a high score that would normally pass the threshold
+        with patch("bot.market_matcher._compute_score", return_value=(0.85, 0.88, 0.78)):
+            result = find_match(
+                kalshi_ticker="NASDAQ-DEC26",
+                kalshi_title="NASDAQ 100 above 18000 December 2026",
+                kalshi_close_date=None,
+                candidates=candidates,
+            )
+        assert result is None, "Cross-index match (NASDAQ vs S&P) must be rejected"
+
+    def test_nasdaq_vs_nasdaq_allowed(self):
+        """
+        Same-index matches (NASDAQ vs NASDAQ) should be allowed.
+        """
+        candidates = [
+            self._make_candidate("NASDAQ closes above 18000 end of year"),
+        ]
+        with patch("bot.market_matcher._compute_score", return_value=(0.82, 0.85, 0.76)):
+            result = find_match(
+                kalshi_ticker="NASDAQ-DEC26",
+                kalshi_title="NASDAQ 100 above 18000 December 2026",
+                kalshi_close_date=None,
+                candidates=candidates,
+            )
+        assert result is not None, "Same-index match (NASDAQ vs NASDAQ) should be allowed"
+
+    def test_non_index_vs_nasdaq_allowed(self):
+        """
+        Non-index market can match anything — no cross-index conflict.
+        """
+        candidates = [
+            self._make_candidate("NASDAQ above 18000 by December"),
+        ]
+        with patch("bot.market_matcher._compute_score", return_value=(0.80, 0.83, 0.73)):
+            result = find_match(
+                kalshi_ticker="KXMISC-DEC26",
+                kalshi_title="Will tech stocks rally in December 2026?",
+                kalshi_close_date=None,
+                candidates=candidates,
+            )
+        assert result is not None, "Non-index title should not trigger cross-index guard"
+
+
+# ── _detect_index() unit tests ────────────────────────────────────────────────
+
+class TestDetectIndex:
+    def test_nasdaq_detected(self):
+        assert _detect_index("NASDAQ 100 above 18000") == "nasdaq"
+
+    def test_sp500_detected(self):
+        assert _detect_index("S&P 500 above 5000") == "sp500"
+
+    def test_dow_detected(self):
+        assert _detect_index("Dow Jones above 40000") == "dow"
+
+    def test_russell_detected(self):
+        assert _detect_index("Russell 2000 closes above 2200") == "russell"
+
+    def test_vix_detected(self):
+        assert _detect_index("VIX above 20 by Friday") == "vix"
+
+    def test_non_index_returns_none(self):
+        assert _detect_index("Will the Fed cut rates?") is None
+
+    def test_case_insensitive(self):
+        assert _detect_index("nasdaq closes above 18000") == "nasdaq"
+        assert _detect_index("S&P 500 ABOVE 5000") == "sp500"
+
+    def test_all_five_indices_covered(self):
+        """INDEX_KEYWORDS must cover all 5 indices."""
+        assert set(INDEX_KEYWORDS.keys()) == {"nasdaq", "sp500", "dow", "russell", "vix"}

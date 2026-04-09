@@ -62,7 +62,8 @@ SCAN_INTERVAL_SEC: int = 300
 # Source: Thorp (2006) "The Kelly Criterion in Blackjack, Sports Betting, and
 # the Stock Market" — symmetric exits maximize growth-adjusted return.
 PROFIT_TAKE_CENTS: int = 20   # Close early if bid >= entry + 20c (symmetric with stop)
-STOP_LOSS_CENTS: int = 20      # Close early if bid <= entry - 20c
+STOP_LOSS_CENTS: int = 20      # Maximum absolute stop-loss (cap, in cents)
+STOP_LOSS_FRACTION: float = 0.40  # Close if bid drops 40% below entry price
 PRICE_STALENESS_CENTS: int = 2
 ORDER_FILL_TIMEOUT_S: int = 30
 
