@@ -211,7 +211,7 @@ async def _manage_positions(client: KalshiClient, session: aiohttp.ClientSession
                     session=session,
                 )
 
-        except Exception as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, OSError) as exc:
             _log.error("Error managing position %s: %s", ticker, exc)
 
 
@@ -442,7 +442,7 @@ async def _scan_markets(client: KalshiClient, session: aiohttp.ClientSession) ->
         async with semaphore:
             try:
                 return await _evaluate_market(market, client, session, balance)
-            except Exception as exc:
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, KeyError, OSError) as exc:
                 _log.debug("Evaluation failed for %s: %s", market.get("ticker"), exc)
                 return None
 
@@ -614,6 +614,7 @@ async def main_loop(single_cycle: bool = False) -> None:
         except (KeyboardInterrupt, asyncio.CancelledError):
             dashboard_task.cancel()
             daily_task.cancel()
+            state_manager.save()  # Flush any pending state (daily PnL, etc.)
             bot_logger.log_event("shutdown", "Bot shut down gracefully.")
             console.print("\n[bold red]Bot stopped.[/bold red]")
 

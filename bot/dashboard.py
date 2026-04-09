@@ -330,7 +330,8 @@ async def run_dashboard() -> None:
             try:
                 live.update(build_layout())
             except Exception as exc:
-                pass  # Dashboard errors must never crash the main loop
+                import logging
+                logging.getLogger(__name__).debug("Dashboard render error: %s", exc)
             await asyncio.sleep(config.DASHBOARD_REFRESH_S)
 
 

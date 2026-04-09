@@ -19,6 +19,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from bot.fair_value import _aggregate_probabilities, _compute_disagreement_mult, FairValue
 
 
+class TestCacheRefreshLock:
+    """Regression: fair_value must use asyncio.Lock to prevent concurrent refresh stampede."""
+
+    def test_refresh_lock_exists(self):
+        """fair_value module must have a _get_refresh_lock helper."""
+        from bot.fair_value import _get_refresh_lock
+        import asyncio
+        # _get_refresh_lock is a sync function that returns an asyncio.Lock
+        lock = _get_refresh_lock()
+        assert isinstance(lock, asyncio.Lock)
+
+    def test_refresh_all_sources_uses_lock(self):
+        """refresh_all_sources must acquire the lock to prevent concurrent refresh."""
+        import inspect
+        from bot.fair_value import refresh_all_sources
+        src = inspect.getsource(refresh_all_sources)
+        assert "_get_refresh_lock" in src or "lock" in src, (
+            "refresh_all_sources must use a lock to prevent concurrent refresh"
+        )
+
+
 class TestSourceDisagreementMult:
     """Regression tests for source disagreement multiplier (C3/C8 fix)."""
 

@@ -67,6 +67,15 @@ _predictit_cache: List[Candidate] = []
 _polymarket_cache: List[Candidate] = []
 _fetched_at: Optional[float] = None
 _CACHE_TTL_S: float = 290.0
+_refresh_lock: Optional[asyncio.Lock] = None  # Lazy-init to avoid event loop issues
+
+
+def _get_refresh_lock() -> asyncio.Lock:
+    """Lazy-initialise the asyncio.Lock (must be created inside a running event loop)."""
+    global _refresh_lock
+    if _refresh_lock is None:
+        _refresh_lock = asyncio.Lock()
+    return _refresh_lock
 
 
 # ── HTTP helper with retry ────────────────────────────────────────────────────
@@ -251,16 +260,22 @@ async def _fetch_polymarket(session: aiohttp.ClientSession) -> List[Candidate]:
 
 # ── Cache management ───────────────────────────────────────────────────────────
 async def refresh_all_sources(session: aiohttp.ClientSession) -> None:
+    """Refresh all source caches. Lock prevents concurrent refresh stampede."""
     global _predictit_cache, _manifold_cache, _polymarket_cache, _fetched_at
-    predictit, manifold, polymarket = await asyncio.gather(
-        _fetch_predictit(session),
-        _fetch_manifold(session),
-        _fetch_polymarket(session),
-    )
-    _predictit_cache = predictit
-    _manifold_cache = manifold
-    _polymarket_cache = polymarket
-    _fetched_at = time.monotonic()
+    lock = _get_refresh_lock()
+    async with lock:
+        # Re-check after acquiring lock (another coroutine may have refreshed)
+        if _caches_valid():
+            return
+        predictit, manifold, polymarket = await asyncio.gather(
+            _fetch_predictit(session),
+            _fetch_manifold(session),
+            _fetch_polymarket(session),
+        )
+        _predictit_cache = predictit
+        _manifold_cache = manifold
+        _polymarket_cache = polymarket
+        _fetched_at = time.monotonic()
 
 
 def _caches_valid() -> bool:

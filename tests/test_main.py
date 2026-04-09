@@ -365,3 +365,100 @@ class TestLogTrimming:
         from bot import logger as bl
         assert hasattr(bl, "_MAX_LOG_BYTES"), "logger must have _MAX_LOG_BYTES"
         assert bl._MAX_LOG_BYTES > 0
+
+
+# ── Graceful shutdown saves state (critique cycle 3 fix) ──────────────────────
+
+class TestGracefulShutdown:
+    """Regression: shutdown handler must call state_manager.save()."""
+
+    def test_shutdown_calls_save(self):
+        """main_loop exception handler must call state_manager.save()."""
+        import inspect
+        from bot.main import main_loop
+        src = inspect.getsource(main_loop)
+        assert "state_manager.save()" in src, (
+            "Shutdown handler must call state_manager.save() to flush pending state"
+        )
+
+
+# ── Exception specificity in position management (critique cycle 3 fix) ───────
+
+class TestExceptionSpecificity:
+    """Regression: exception handlers must not use bare 'except Exception'."""
+
+    def test_manage_positions_no_bare_exception(self):
+        """_manage_positions must catch specific exceptions, not bare Exception."""
+        import inspect
+        from bot.main import _manage_positions
+        src = inspect.getsource(_manage_positions)
+        # Should have specific exception types, not 'except Exception'
+        assert "except Exception" not in src, (
+            "_manage_positions must use specific exception types"
+        )
+
+    def test_evaluate_semaphore_no_bare_exception(self):
+        """Market evaluation exception handler must be specific."""
+        import inspect
+        from bot.main import _scan_markets
+        src = inspect.getsource(_scan_markets)
+        assert "except Exception" not in src, (
+            "_scan_markets semaphore handler must use specific exception types"
+        )
+
+
+# ── Arb Discord notification shows net profit (critique cycle 3 fix) ──────────
+
+class TestArbNotificationNetProfit:
+    """Regression: arb Discord alerts must show net profit (after fees)."""
+
+    def test_arb_notification_includes_fees(self):
+        """place_arb_pair must compute and display net_profit (not gross)."""
+        import inspect
+        from bot.executor import place_arb_pair
+        src = inspect.getsource(place_arb_pair)
+        assert "net_profit" in src, (
+            "place_arb_pair must show net profit (after fees) in notification"
+        )
+        assert "compute_taker_fee" in src, (
+            "place_arb_pair must compute fees for the notification"
+        )
+
+
+# ── Backtest uses exec_price not midpoint (critique cycle 3 fix) ──────────────
+
+class TestBacktestExecPrice:
+    """Regression: backtest must use exec_price (ask), not market_price (midpoint)."""
+
+    def test_backtest_uses_exec_price(self):
+        """_run_backtest must assign entry_price from result.exec_price."""
+        import inspect
+        from backtest import _run_backtest
+        src = inspect.getsource(_run_backtest)
+        assert "result.exec_price" in src, (
+            "Backtest must use result.exec_price (ask), not result.market_price (midpoint)"
+        )
+        assert "result.market_price" not in src, (
+            "Backtest must NOT use result.market_price (midpoint) for entry price"
+        )
+
+    def test_backtest_uses_adaptive_min_edge(self):
+        """_run_backtest must use result.min_edge_used, not config.MIN_EDGE."""
+        import inspect
+        from backtest import _run_backtest
+        src = inspect.getsource(_run_backtest)
+        assert "result.min_edge_used" in src, (
+            "Backtest must use adaptive min_edge (result.min_edge_used)"
+        )
+        assert "config.MIN_EDGE" not in src, (
+            "Backtest must NOT use hardcoded config.MIN_EDGE"
+        )
+
+    def test_backtest_passes_source_count(self):
+        """_run_backtest must pass source_count to compute_edge."""
+        import inspect
+        from backtest import _run_backtest
+        src = inspect.getsource(_run_backtest)
+        assert "source_count" in src, (
+            "Backtest must pass source_count to compute_edge for realistic simulation"
+        )

@@ -337,6 +337,7 @@ def _run_backtest(
             continue
 
         # Compute edge
+        # Simulate dual-source confidence (realistic median for the bot)
         try:
             result = edge_calculator.compute_edge(
                 w=mkt.fair_prob,
@@ -344,25 +345,24 @@ def _run_backtest(
                 q=mkt.no_price,
                 balance=balance,
                 ticker=mkt.ticker,
+                source_count=2,
             )
         except ValueError:
             continue
 
-        if result.direction == "NONE" or result.net_edge < config.MIN_EDGE:
+        if result.direction == "NONE" or result.net_edge < result.min_edge_used:
             continue
 
         direction = result.direction
-        entry_price = result.market_price
-        stake_usd = result.stake_usd
-        kelly_f = result.kelly_fraction
-
-        # Sizing
-        num_contracts = math.floor(stake_usd / entry_price)
+        # FIX: Use exec_price (ask), not market_price (midpoint).
+        # The bot executes at the ask; using midpoint overstates returns by ~spread/2.
+        entry_price = result.exec_price
+        num_contracts = result.contracts   # Pre-computed fee-aware sizing
         if num_contracts < 1:
             continue
 
-        actual_stake = num_contracts * entry_price
-        fee = fee_calculator.compute_taker_fee(entry_price, num_contracts, mkt.ticker)
+        actual_stake = result.stake_usd
+        fee = result.fee_usd
 
         # Simulate resolution
         resolved_yes = mkt.resolved_yes

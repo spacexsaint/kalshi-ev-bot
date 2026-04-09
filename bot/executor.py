@@ -314,11 +314,17 @@ async def place_arb_pair(
     yes_cents = int(yes_ask * 100)
     no_cents = int(no_ask * 100)
     spread = 1.0 - yes_ask - no_ask
-    guaranteed_profit = spread * n_contracts
+
+    # FIX: Show net profit (after fees) in notifications, not gross spread profit.
+    # Gross profit overstates actual returns and misleads the operator.
+    from bot.fee_calculator import compute_taker_fee
+    yes_fee = compute_taker_fee(yes_ask, n_contracts, ticker)
+    no_fee = compute_taker_fee(no_ask, n_contracts, ticker)
+    net_profit = spread * n_contracts - yes_fee - no_fee
 
     _log.info(
-        "PURE ARB: ticker=%s, yes_ask=%.2f, no_ask=%.2f, spread=%.4f, n=%d, guaranteed_profit=%.2f",
-        ticker, yes_ask, no_ask, spread, n_contracts, guaranteed_profit,
+        "PURE ARB: ticker=%s, yes_ask=%.2f, no_ask=%.2f, spread=%.4f, n=%d, net_profit=%.2f (fees=%.4f)",
+        ticker, yes_ask, no_ask, spread, n_contracts, net_profit, yes_fee + no_fee,
     )
 
     if config.PAPER_MODE:
@@ -331,7 +337,7 @@ async def place_arb_pair(
             f"🔷 **PURE ARB** `PAPER`\n"
             f"**{ticker}** | YES@{yes_cents}¢ + NO@{no_cents}¢\n"
             f"Contracts: **{n_contracts}** | Spread: **{spread:.4f}** | "
-            f"Guaranteed Profit: **${guaranteed_profit:.2f}**",
+            f"Net Profit: **${net_profit:.2f}** (fees: ${yes_fee + no_fee:.4f})",
         )
         return yes_fill, no_fill
 
@@ -345,7 +351,7 @@ async def place_arb_pair(
         f"🔷 **PURE ARB** `LIVE`\n"
         f"**{ticker}** | YES@{yes_cents}¢ + NO@{no_cents}¢\n"
         f"Contracts: **{n_contracts}** | Spread: **{spread:.4f}** | "
-        f"Guaranteed Profit: **${guaranteed_profit:.2f}**\n"
+        f"Net Profit: **${net_profit:.2f}** (fees: ${yes_fee + no_fee:.4f})\n"
         f"YES fill: {'OK' if yes_fill.success else 'FAIL'} | "
         f"NO fill: {'OK' if no_fill.success else 'FAIL'}",
     )
