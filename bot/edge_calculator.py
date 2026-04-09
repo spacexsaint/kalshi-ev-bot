@@ -60,6 +60,7 @@ class EdgeResult:
     time_decay_mult: float
     uncertainty_mult: float
     source_count: int
+    min_edge_used: float = 0.05  # Adaptive threshold that was actually applied
 
 
 def _validate_probability(value: float, name: str) -> None:
@@ -85,6 +86,29 @@ def compute_uncertainty_multiplier(source_count: int) -> float:
     if source_count == 2:
         return config.KL_UNCERTAINTY_PENALTY_DUAL_SOURCE
     return config.KL_UNCERTAINTY_PENALTY_SINGLE_SOURCE
+
+
+def get_min_edge(source_count: int) -> float:
+    """
+    Adaptive minimum edge threshold by source confidence level.
+
+    Rationale: A triple-source consensus (PredictIt + Manifold + Polymarket
+    all agreeing) gives a much more reliable w estimate than a single source.
+    Requiring the same 5% edge for both ignores this signal quality difference.
+
+    Combined with the KL-uncertainty stake multiplier, this creates a two-layer
+    filter: we both reduce stake size AND require a larger edge for uncertain bets.
+
+    Thresholds (config.py):
+      Triple: 3%  — high confidence, lower bar acceptable
+      Dual:   5%  — standard bar
+      Single: 8%  — extra margin to compensate for w estimation uncertainty
+    """
+    if source_count >= 3:
+        return config.MIN_EDGE_TRIPLE_SOURCE
+    if source_count == 2:
+        return config.MIN_EDGE_DUAL_SOURCE
+    return config.MIN_EDGE_SINGLE_SOURCE
 
 
 def _compute_midpoint(bid: float, ask: float) -> float:
@@ -233,6 +257,7 @@ def compute_edge(
 
     td = compute_time_decay_multiplier(hours_to_close)
     um = compute_uncertainty_multiplier(source_count)
+    min_edge = get_min_edge(source_count)  # Adaptive: 3%/5%/8% by confidence
 
     def _no_bet(exec_p: float = p) -> EdgeResult:
         return EdgeResult(
@@ -242,6 +267,7 @@ def compute_edge(
             market_price=_compute_midpoint(yes_bid, p) if yes_bid > 0 else p,
             exec_price=exec_p, fee_usd=0.0, gross_ev=0.0, net_ev=0.0,
             time_decay_mult=td, uncertainty_mult=um, source_count=source_count,
+            min_edge_used=min_edge,
         )
 
     if balance <= 0:
@@ -250,12 +276,12 @@ def compute_edge(
     # YES side
     y = _compute_side(w, yes_bid, p, balance, um, td, ticker, is_yes=True)
     yg, yn, yk, ya, yc, yf, yev, yp, ymid = y
-    yes_ok = yn >= config.MIN_EDGE and yc >= 1
+    yes_ok = yn >= min_edge and yc >= 1
 
     # NO side
     n_ = _compute_side(w, no_bid, q, balance, um, td, ticker, is_yes=False)
     ng, nn, nk, na, nc, nf, nev, np_, nmid = n_
-    no_ok = nn >= config.MIN_EDGE and nc >= 1
+    no_ok = nn >= min_edge and nc >= 1
 
     if not yes_ok and not no_ok:
         return _no_bet()
@@ -268,6 +294,7 @@ def compute_edge(
             contracts=yc, fair_prob=w, market_price=ymid, exec_price=yp,
             fee_usd=yf, gross_ev=yg * yc * yp, net_ev=yev,
             time_decay_mult=td, uncertainty_mult=um, source_count=source_count,
+            min_edge_used=min_edge,
         )
 
     def _no_result() -> EdgeResult:
@@ -278,6 +305,7 @@ def compute_edge(
             contracts=nc, fair_prob=w, market_price=nmid, exec_price=np_,
             fee_usd=nf, gross_ev=ng * nc * np_, net_ev=nev,
             time_decay_mult=td, uncertainty_mult=um, source_count=source_count,
+            min_edge_used=min_edge,
         )
 
     if yes_ok and no_ok:

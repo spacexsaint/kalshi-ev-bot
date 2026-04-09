@@ -152,6 +152,7 @@ async def _manage_positions(client: KalshiClient, session: aiohttp.ClientSession
                         client=client,
                         session=session,
                     )
+                    dashboard.clear_live_bid(ticker)
 
                     # Log Brier score for calibration tracking
                     if resolved_yes is not None:
@@ -169,6 +170,9 @@ async def _manage_positions(client: KalshiClient, session: aiohttp.ClientSession
 
             current_bid = ob.yes_bid if direction == "YES" else ob.no_bid
             current_bid_cents = int(current_bid * 100)
+
+            # Push live bid to dashboard for mark-to-market unrealised P&L
+            dashboard.update_live_bid(ticker, current_bid)
 
             # Profit-take: bid moved +PROFIT_TAKE_CENTS in our favour
             if current_bid_cents >= entry_cents + config.PROFIT_TAKE_CENTS:
@@ -279,6 +283,7 @@ async def _evaluate_market(
         "mid_price_cents": int(result.market_price * 100),
         "contracts": result.contracts,       # Pre-computed with fee deducted
         "stake_usd": result.stake_usd,       # Actual cost = contracts*price + fee
+        "eval_spread": ob.yes_ask - ob.yes_bid,  # Spread at eval time (for momentum filter)
         "net_edge": result.net_edge,
         "gross_edge": result.gross_edge,
         "kelly_fraction": result.kelly_fraction,
@@ -386,6 +391,18 @@ async def _scan_markets(client: KalshiClient, session: aiohttp.ClientSession) ->
             _log.info(
                 "Stale price on %s: was %dc, now %dc. Skipping.",
                 ticker, original_price, fresh_price,
+            )
+            continue
+
+        # Spread momentum filter: skip if spread widened significantly
+        # A rapidly widening spread signals liquidity withdrawal
+        fresh_spread = ob.yes_ask - ob.yes_bid
+        eval_spread = candidate.get("eval_spread", 0.0)
+        if eval_spread > 0 and fresh_spread > eval_spread * config.SPREAD_WIDENING_FACTOR:
+            _log.info(
+                "Spread widening on %s: eval=%.3f, now=%.3f (%.0f%% wider). Skipping.",
+                ticker, eval_spread, fresh_spread,
+                (fresh_spread / eval_spread - 1) * 100,
             )
             continue
 

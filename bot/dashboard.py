@@ -24,7 +24,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from rich.console import Console
 from rich.layout import Layout
@@ -45,6 +45,9 @@ _current_balance: float = 0.0
 _next_scan_at: float = time.monotonic()
 _last_5_trades: List[dict] = []
 _started_at: datetime = datetime.now(timezone.utc)
+# Live bid prices for open positions (ticker → current_bid_decimal)
+# Pushed by main loop during Phase 1 position management scans
+_live_bids: Dict[str, float] = {}
 
 
 def update_balance(balance: float) -> None:
@@ -55,6 +58,16 @@ def update_balance(balance: float) -> None:
 def update_next_scan(next_scan_monotonic: float) -> None:
     global _next_scan_at
     _next_scan_at = next_scan_monotonic
+
+
+def update_live_bid(ticker: str, bid_decimal: float) -> None:
+    """Push current best bid for an open position (for unrealised P&L display)."""
+    _live_bids[ticker] = bid_decimal
+
+
+def clear_live_bid(ticker: str) -> None:
+    """Remove bid tracking when position is closed."""
+    _live_bids.pop(ticker, None)
 
 
 def push_trade(trade: dict) -> None:
@@ -167,14 +180,15 @@ def _build_positions_table() -> Table:
     table.add_column("Ticker", style="white", no_wrap=True)
     table.add_column("Dir", style="bold", no_wrap=True, width=4)
     table.add_column("Entry", justify="right", no_wrap=True)
+    table.add_column("Cur", justify="right", no_wrap=True)  # Live bid
     table.add_column("Contracts", justify="right")
-    table.add_column("Stake", justify="right")
+    table.add_column("Unreal P&L", justify="right")          # Mark-to-market
     table.add_column("Edge", justify="right")
     table.add_column("Since", no_wrap=True)
 
     if not positions:
         table.add_row(
-            "—", "—", "—", "—", "—", "—", "—",
+            "—", "—", "—", "—", "—", "—", "—", "—",
             style="dim",
         )
     else:
@@ -183,17 +197,34 @@ def _build_positions_table() -> Table:
             dir_style = "green" if direction == "YES" else "red"
             edge = pos.get("net_edge_at_entry", 0.0)
             opened_at = pos.get("opened_at", "")
+            ticker = pos.get("ticker", "—")
+            entry_cents = pos.get("entry_price_cents", 0)
+            contracts = pos.get("contracts", 0.0)
+
+            # Live mark-to-market unrealised P&L
+            live_bid = _live_bids.get(ticker)
+            if live_bid is not None and entry_cents > 0:
+                upnl = (live_bid - entry_cents / 100.0) * contracts
+                upnl_str = f"{'+'if upnl>=0 else ''}{upnl:.2f}"
+                upnl_style = "bold green" if upnl > 0 else "bold red" if upnl < 0 else "dim"
+                cur_str = f"{int(live_bid*100)}¢"
+            else:
+                upnl_str = "—"
+                upnl_style = "dim"
+                cur_str = "—"
+
             try:
                 dt = datetime.fromisoformat(opened_at)
                 since = dt.strftime("%H:%M")
             except (ValueError, TypeError):
                 since = "—"
             table.add_row(
-                pos.get("ticker", "—"),
+                ticker,
                 Text(direction, style=f"bold {dir_style}"),
-                f"{pos.get('entry_price_cents', 0)}¢",
-                f"{pos.get('contracts', 0):.1f}",
-                f"${pos.get('stake_usd', 0):.2f}",
+                f"{entry_cents}¢",
+                cur_str,
+                f"{contracts:.1f}",
+                Text(upnl_str, style=upnl_style),
                 f"{edge:.1%}",
                 since,
             )

@@ -59,6 +59,17 @@ class FillResult:
     partial: bool
     order_id: str
     client_order_id: str
+    # Actual fees paid as reported by Kalshi API (taker + maker, both in dollars)
+    # If None, we fall back to computed taker fee estimate
+    actual_taker_fee: Optional[float] = None
+    actual_maker_fee: Optional[float] = None
+
+    @property
+    def actual_total_fee(self) -> Optional[float]:
+        """Total actual fee if available from API response."""
+        if self.actual_taker_fee is not None or self.actual_maker_fee is not None:
+            return (self.actual_taker_fee or 0.0) + (self.actual_maker_fee or 0.0)
+        return None
 
 
 async def _simulate_paper_fill(num_contracts: int, client_order_id: str) -> FillResult:
@@ -114,6 +125,29 @@ async def _execute_live_order(
     if filled_contracts == 0:
         return FillResult(False, 0.0, False, order_id, client_order_id)
     return FillResult(True, filled_contracts, True, order_id, client_order_id)
+
+
+def _extract_fees_from_order(order_status: Optional[dict]) -> tuple[Optional[float], Optional[float]]:
+    """
+    Extract actual taker and maker fees paid from Kalshi order status response.
+
+    Kalshi returns fees in the order object as:
+      taker_fees_dollars: str (e.g. "0.1800")
+      maker_fees_dollars: str (e.g. "0.0000")
+
+    When a limit order rests on the book and is filled as a maker, taker_fees_dollars
+    will be 0.00 and maker_fees_dollars will reflect the actual (4x cheaper) fee.
+    Tracking this lets us measure the true cost of each trade and validate the
+    fee model against reality.
+    """
+    if not order_status:
+        return None, None
+    try:
+        taker = float(order_status.get("taker_fees_dollars", "") or 0)
+        maker = float(order_status.get("maker_fees_dollars", "") or 0)
+        return (taker if taker > 0 else None), (maker if maker > 0 else None)
+    except (TypeError, ValueError):
+        return None, None
 
 
 # ── place_bet ──────────────────────────────────────────────────────────────────
@@ -191,9 +225,16 @@ async def place_bet(
         )
         return False
 
-    # Compute actual fill cost
-    filled_fee = compute_taker_fee(price_decimal, int(fill.filled_contracts), ticker)
+    # Use actual fee from API if available (captures maker vs taker split)
+    # Falls back to computed taker fee estimate if API didn't return fee data
+    if fill.actual_total_fee is not None:
+        filled_fee = fill.actual_total_fee
+        fee_type = "actual (API)"
+    else:
+        filled_fee = compute_taker_fee(price_decimal, int(fill.filled_contracts), ticker)
+        fee_type = "estimated (taker)"
     filled_cost = fill.filled_contracts * price_decimal + filled_fee
+    _log.debug("Fill fee: $%.4f (%s)", filled_fee, fee_type)
 
     state_manager.add_position(
         ticker=ticker,

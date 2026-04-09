@@ -33,7 +33,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Trading Parameters ─────────────────────────────────────────────────────────
-MIN_EDGE: float = 0.05          # 5% net-of-fees minimum edge
+# Adaptive MIN_EDGE by source confidence:
+#   Triple (3 sources agree): lower bar is justified — w is more accurate
+#   Dual   (2 sources):       standard bar
+#   Single (1 source):        higher bar — higher uncertainty in w estimate
+# Rationale: KL-uncertainty already halves the Kelly STAKE for single-source.
+#   But we also want to require a larger gross edge to compensate for the
+#   higher estimation variance in w. Using a flat 5% treats high-confidence
+#   and low-confidence bets identically, which under-filters uncertain bets.
+MIN_EDGE: float = 0.05             # Global fallback (not used directly — see below)
+MIN_EDGE_TRIPLE_SOURCE: float = 0.03   # 3% — high confidence in w
+MIN_EDGE_DUAL_SOURCE: float = 0.05     # 5% — standard
+MIN_EDGE_SINGLE_SOURCE: float = 0.08   # 8% — extra margin for uncertainty
+
 KELLY_FRACTION: float = 0.25   # Quarter-Kelly (arXiv 2020: optimal risk/return tradeoff)
 MAX_BET_PCT: float = 0.05      # Max 5% of balance per single bet
 MIN_BET_USD: float = 1.00      # Kalshi minimum ($1)
@@ -59,6 +71,10 @@ MIN_MARKET_VOLUME: int = 5000
 MIN_TIME_TO_CLOSE_HR: int = 2
 MAX_TIME_TO_CLOSE_DAYS: int = 30
 MAX_BID_ASK_SPREAD: float = 0.05
+# Spread momentum: skip if fresh spread > eval_spread x this factor
+# A rapidly widening spread signals liquidity withdrawal — bad time to enter
+# 1.5 = skip if spread grew >50% between evaluation and final execution check
+SPREAD_WIDENING_FACTOR: float = 1.5
 
 # ── Time-Decay Edge Discounting ────────────────────────────────────────────────
 TIME_DECAY_THRESHOLD_HR: float = 24.0
