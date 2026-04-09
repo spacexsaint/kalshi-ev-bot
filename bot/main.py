@@ -246,14 +246,19 @@ async def _place_arb_trade(
     cost_per_pair = yes_ask + no_ask
     # Use half of normal max bet sizing since we're buying 2 sides
     arb_budget = config.MAX_BET_PCT * balance / 2.0
-    n = math.floor(arb_budget / cost_per_pair) if cost_per_pair > 0 else 0
+
+    # Include per-pair fees in the denominator so total cost never exceeds budget.
+    # Fee per pair = fee(yes_ask, 1) + fee(no_ask, 1); total cost = n * (cost_per_pair + fee_per_pair).
+    from bot.fee_calculator import compute_taker_fee
+    fee_per_pair = compute_taker_fee(yes_ask, 1, ticker) + compute_taker_fee(no_ask, 1, ticker)
+    cost_with_fees = cost_per_pair + fee_per_pair
+    n = math.floor(arb_budget / cost_with_fees) if cost_with_fees > 0 else 0
 
     if n < 1:
         _log.info("Arb too small: budget=%.2f, cost_per_pair=%.2f", arb_budget, cost_per_pair)
         return
 
-    # Subtract fees from guaranteed profit — arb is NOT riskless if fees exceed spread
-    from bot.fee_calculator import compute_taker_fee
+    # Subtract actual fees from guaranteed profit — arb is NOT riskless if fees exceed spread
     yes_fee = compute_taker_fee(yes_ask, n, ticker)
     no_fee = compute_taker_fee(no_ask, n, ticker)
     spread = 1.0 - cost_per_pair

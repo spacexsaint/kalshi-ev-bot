@@ -37,13 +37,29 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_MAX_LOG_BYTES: int = 10 * 1024 * 1024  # 10 MB max per JSONL file
+_TRIM_KEEP_LINES: int = 25_000          # After trim, keep this many recent lines
+_write_count: Dict[str, int] = {}
+
+
 def _write(path: str, record: Dict[str, Any]) -> None:
-    """Append one JSON object as a line (JSONL format)."""
+    """Append one JSON object as a line (JSONL format). Trims when file exceeds _MAX_LOG_BYTES."""
     _ensure_dir(path)
     lock = _get_lock(path)
     with lock:
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
+        # Check file size every 500 writes to avoid stat() on every append
+        _write_count[path] = _write_count.get(path, 0) + 1
+        if _write_count[path] % 500 == 0:
+            try:
+                if os.path.getsize(path) > _MAX_LOG_BYTES:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        lines = fh.readlines()
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.writelines(lines[-_TRIM_KEEP_LINES:])
+            except OSError:
+                pass  # Non-fatal — trimming is best-effort
 
 
 # ── Trade logging ──────────────────────────────────────────────────────────────

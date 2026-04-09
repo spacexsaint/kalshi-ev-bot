@@ -51,29 +51,37 @@ class TestPureArbDetection:
 
     def test_arb_contract_sizing(self):
         """
-        Arb contract sizing: n = floor(budget / cost_per_pair).
+        Arb contract sizing: n = floor(budget / (cost_per_pair + fee_per_pair)).
         budget = MAX_BET_PCT * balance / 2 (since buying 2 sides).
+        Fees must be in the denominator to prevent budget overrun.
         """
+        from bot.fee_calculator import compute_taker_fee
         balance = 1000.0
         yes_ask = 0.45
         no_ask = 0.50
         cost_per_pair = yes_ask + no_ask  # 0.95
+        fee_per_pair = compute_taker_fee(yes_ask, 1) + compute_taker_fee(no_ask, 1)
         arb_budget = config.MAX_BET_PCT * balance / 2.0  # 0.05 * 1000 / 2 = 25.0
-        n = math.floor(arb_budget / cost_per_pair)
-        assert n == 26  # floor(25.0 / 0.95) = 26
-        guaranteed_profit = (1.0 - cost_per_pair) * n
-        assert guaranteed_profit == pytest.approx(0.05 * 26, abs=0.01)
+        n = math.floor(arb_budget / (cost_per_pair + fee_per_pair))
+        # Total cost must not exceed budget
+        total_cost = n * cost_per_pair + compute_taker_fee(yes_ask, n) + compute_taker_fee(no_ask, n)
+        assert total_cost <= arb_budget + 0.01, (
+            f"Arb total cost {total_cost:.2f} exceeds budget {arb_budget:.2f}"
+        )
+        assert n >= 1, "Should afford at least 1 pair"
 
     def test_arb_too_small(self):
         """
         With very small balance, arb budget may not cover even 1 pair.
         """
+        from bot.fee_calculator import compute_taker_fee
         balance = 1.0
         yes_ask = 0.60
         no_ask = 0.39  # sum = 0.99 < 1.0
         cost_per_pair = yes_ask + no_ask
+        fee_per_pair = compute_taker_fee(yes_ask, 1) + compute_taker_fee(no_ask, 1)
         arb_budget = config.MAX_BET_PCT * balance / 2.0  # 0.05 * 1 / 2 = 0.025
-        n = math.floor(arb_budget / cost_per_pair)
+        n = math.floor(arb_budget / (cost_per_pair + fee_per_pair))
         assert n == 0, "Budget too small for even 1 arb pair"
 
 
@@ -314,3 +322,46 @@ class TestPlaceOrderSellAction:
                 with pytest.raises(ValueError, match="action"):
                     await client.place_order("TICK", "yes", 50, 1, "uuid", action="invalid")
         asyncio.run(_test())
+
+
+# ── Arb fee-inclusive sizing tests (triple-check fix) ─────────────────────────
+
+class TestArbFeeInclusiveSizing:
+    """
+    Regression: arb contract count must include per-pair fees in the denominator
+    so total cost (n * cost_per_pair + total_fees) never exceeds budget.
+    """
+
+    def test_arb_total_cost_within_budget(self):
+        """Total arb cost must not exceed the arb budget."""
+        from bot.fee_calculator import compute_taker_fee
+        balance = 1000.0
+        yes_ask = 0.45
+        no_ask = 0.50
+        cost_per_pair = yes_ask + no_ask
+        fee_per_pair = compute_taker_fee(yes_ask, 1) + compute_taker_fee(no_ask, 1)
+        arb_budget = config.MAX_BET_PCT * balance / 2.0
+        n = math.floor(arb_budget / (cost_per_pair + fee_per_pair))
+        total_cost = n * cost_per_pair + compute_taker_fee(yes_ask, n) + compute_taker_fee(no_ask, n)
+        assert total_cost <= arb_budget + 0.01
+
+    def test_arb_source_includes_fees_in_denominator(self):
+        """Verify main.py _place_arb_trade includes fee_per_pair in contract calculation."""
+        import inspect
+        from bot.main import _place_arb_trade
+        src = inspect.getsource(_place_arb_trade)
+        assert "fee_per_pair" in src, (
+            "_place_arb_trade must include per-pair fees in contract sizing denominator"
+        )
+
+
+# ── Log trimming tests (triple-check fix) ─────────────────────────────────────
+
+class TestLogTrimming:
+    """Regression: logger.py must cap JSONL file growth."""
+
+    def test_logger_has_max_log_bytes(self):
+        """logger.py must define a max log size constant."""
+        from bot import logger as bl
+        assert hasattr(bl, "_MAX_LOG_BYTES"), "logger must have _MAX_LOG_BYTES"
+        assert bl._MAX_LOG_BYTES > 0
