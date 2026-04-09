@@ -394,6 +394,7 @@ class KalshiClient:
         price_cents: int,    # 1–99
         num_contracts: int,
         client_order_id: str,
+        action: str = "buy",  # "buy" | "sell"
     ) -> Optional[dict]:
         """
         Place a limit order.
@@ -405,6 +406,7 @@ class KalshiClient:
             price_cents:     Limit price in cents (1–99)
             num_contracts:   Whole contracts only
             client_order_id: UUID for deduplication
+            action:          "buy" (default) or "sell" (for closing positions)
 
         Returns:
             Raw order dict from API, or None on failure.
@@ -413,10 +415,12 @@ class KalshiClient:
             raise ValueError(f"price_cents must be 1–99, got {price_cents}")
         if num_contracts < 1:
             raise ValueError(f"num_contracts must be >= 1, got {num_contracts}")
+        if action not in ("buy", "sell"):
+            raise ValueError(f"action must be 'buy' or 'sell', got {action!r}")
 
         body: dict = {
             "ticker": ticker,
-            "action": "buy",
+            "action": action,
             "side": side.lower(),
             "count": num_contracts,
             "type": "limit",

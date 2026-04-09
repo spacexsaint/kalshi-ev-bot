@@ -4,6 +4,10 @@ test_main.py — Regression tests for main.py fixes.
 Tests:
   - Pure arbitrage detection (C10/C15 fix)
   - Relative stop-loss logic (C11 fix)
+  - Arb fee accounting (deep critique fix)
+  - Adaptive min_edge gate (deep critique fix)
+  - Existing position arb guard (deep critique fix)
+  - Daily start balance not overwritten on scan (deep critique fix)
 """
 
 import math
@@ -155,3 +159,158 @@ class TestRelativeStopLoss:
         assert stop == 6
         # The relative stop actually protects us at low prices
         assert stop > 0, "Stop must be positive for low-priced positions"
+
+
+# ── Arb fee accounting tests (deep critique fix) ────────────────────────────
+
+class TestArbFeeAccounting:
+    """
+    Regression: arb profit must subtract fees.
+    A spread of 0.02 per pair can be wiped out by taker fees on both sides.
+    """
+
+    def test_arb_profit_subtracts_fees(self):
+        """
+        Verify the arb profit formula includes fee subtraction.
+        spread=0.05, n=10, but fees eat into the profit.
+        """
+        from bot.fee_calculator import compute_taker_fee
+        yes_ask = 0.45
+        no_ask = 0.50
+        n = 10
+        spread = 1.0 - yes_ask - no_ask
+        yes_fee = compute_taker_fee(yes_ask, n)
+        no_fee = compute_taker_fee(no_ask, n)
+        net_profit = spread * n - yes_fee - no_fee
+        # With fees, net profit is less than gross
+        assert net_profit < spread * n
+        # But with a decent spread it's still positive
+        assert net_profit > 0
+
+    def test_arb_unprofitable_thin_spread(self):
+        """
+        A tiny spread (0.01) on 1 contract is wiped out by fees.
+        Each side's fee rounds up to $0.01, total = $0.02 > $0.01 spread.
+        """
+        from bot.fee_calculator import compute_taker_fee
+        yes_ask = 0.50
+        no_ask = 0.49  # sum = 0.99, spread = 0.01
+        n = 1
+        spread = 1.0 - yes_ask - no_ask
+        yes_fee = compute_taker_fee(yes_ask, n)
+        no_fee = compute_taker_fee(no_ask, n)
+        net_profit = spread * n - yes_fee - no_fee
+        assert net_profit <= 0, "Thin spread arb should be unprofitable after fees"
+
+
+# ── Adaptive min_edge gate tests (deep critique fix) ────────────────────────
+
+class TestAdaptiveMinEdgeGate:
+    """
+    Regression: main.py must use result.min_edge_used (adaptive threshold)
+    instead of the fixed config.MIN_EDGE=0.05.
+    """
+
+    def test_triple_source_uses_3pct_threshold(self):
+        """
+        A triple-source bet with 4% net edge passes compute_edge (threshold=3%)
+        but was previously rejected by main.py's hardcoded 5% gate.
+        """
+        from bot.edge_calculator import compute_edge
+        r = compute_edge(w=0.60, p=0.565, q=0.44, balance=1000, source_count=3)
+        # If compute_edge says YES/NO, the edge passed the adaptive threshold
+        # main.py should also accept it (uses result.min_edge_used now)
+        if r.direction != "NONE":
+            assert r.min_edge_used == pytest.approx(config.MIN_EDGE_TRIPLE_SOURCE)
+            # The net edge should be >= the adaptive threshold (not the global 5%)
+            assert r.net_edge >= r.min_edge_used
+
+    def test_main_py_does_not_use_global_min_edge(self):
+        """
+        Verify main.py references result.min_edge_used, not config.MIN_EDGE.
+        """
+        import inspect
+        from bot.main import _evaluate_market
+        src = inspect.getsource(_evaluate_market)
+        assert "result.min_edge_used" in src, (
+            "_evaluate_market must use result.min_edge_used, not config.MIN_EDGE"
+        )
+        assert "config.MIN_EDGE" not in src, (
+            "_evaluate_market must NOT use config.MIN_EDGE (use adaptive threshold)"
+        )
+
+
+# ── Existing position arb guard tests (deep critique fix) ───────────────────
+
+class TestArbExistingPositionGuard:
+    """
+    Regression: _place_arb_trade must skip if we already hold a position
+    on the same ticker — partial exposure makes the arb not riskless.
+    """
+
+    def test_arb_guard_in_source(self):
+        """Verify _place_arb_trade checks state_manager.get_position."""
+        import inspect
+        from bot.main import _place_arb_trade
+        src = inspect.getsource(_place_arb_trade)
+        assert "get_position" in src, (
+            "_place_arb_trade must check for existing position before arb"
+        )
+
+
+# ── Daily start balance not overwritten tests (deep critique fix) ────────────
+
+class TestDailyStartBalanceNotOverwritten:
+    """
+    Regression: _scan_markets must NOT call set_daily_start_balance,
+    which caused 'loss amnesia' by resetting the baseline on every scan.
+    """
+
+    def test_scan_markets_no_set_daily_start_balance(self):
+        """Verify _scan_markets does not call set_daily_start_balance."""
+        import inspect
+        from bot.main import _scan_markets
+        src = inspect.getsource(_scan_markets)
+        assert "set_daily_start_balance" not in src, (
+            "_scan_markets must NOT call set_daily_start_balance (loss amnesia bug)"
+        )
+
+
+# ── place_order sell action tests (deep critique fix) ───────────────────────
+
+class TestPlaceOrderSellAction:
+    """
+    Regression: place_order must support action='sell' for closing positions.
+    Previously hardcoded action='buy', meaning close_position placed BUY orders.
+    """
+
+    def test_place_order_accepts_sell(self):
+        """KalshiClient.place_order must accept action='sell'."""
+        import inspect
+        from bot.kalshi_client import KalshiClient
+        sig = inspect.signature(KalshiClient.place_order)
+        assert "action" in sig.parameters, "place_order must have 'action' parameter"
+        # Default should be 'buy' for backward compatibility
+        assert sig.parameters["action"].default == "buy"
+
+    def test_close_position_uses_sell(self):
+        """executor.close_position must pass action='sell' to _execute_live_order."""
+        import inspect
+        from bot.executor import close_position
+        src = inspect.getsource(close_position)
+        assert 'action="sell"' in src, (
+            "close_position must pass action='sell' to _execute_live_order"
+        )
+
+    def test_place_order_rejects_invalid_action(self):
+        """place_order must raise ValueError for invalid action."""
+        import asyncio
+        import aiohttp
+        from bot.kalshi_client import KalshiClient
+
+        async def _test():
+            async with aiohttp.ClientSession() as session:
+                client = KalshiClient(session)
+                with pytest.raises(ValueError, match="action"):
+                    await client.place_order("TICK", "yes", 50, 1, "uuid", action="invalid")
+        asyncio.run(_test())

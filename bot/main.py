@@ -237,6 +237,12 @@ async def _place_arb_trade(
         _log.info("Arb skipped (risk): %s", reason)
         return
 
+    # Skip arb if we already hold a position on this market — partial exposure
+    # makes the "riskless" arb not actually riskless
+    if state_manager.get_position(ticker) is not None:
+        _log.info("Arb skipped: already hold position on %s", ticker)
+        return
+
     cost_per_pair = yes_ask + no_ask
     # Use half of normal max bet sizing since we're buying 2 sides
     arb_budget = config.MAX_BET_PCT * balance / 2.0
@@ -246,8 +252,19 @@ async def _place_arb_trade(
         _log.info("Arb too small: budget=%.2f, cost_per_pair=%.2f", arb_budget, cost_per_pair)
         return
 
+    # Subtract fees from guaranteed profit — arb is NOT riskless if fees exceed spread
+    from bot.fee_calculator import compute_taker_fee
+    yes_fee = compute_taker_fee(yes_ask, n, ticker)
+    no_fee = compute_taker_fee(no_ask, n, ticker)
     spread = 1.0 - cost_per_pair
-    guaranteed_profit = spread * n
+    guaranteed_profit = spread * n - yes_fee - no_fee
+
+    if guaranteed_profit <= 0:
+        _log.info(
+            "Arb unprofitable after fees: spread=%.4f, n=%d, yes_fee=%.4f, no_fee=%.4f, net=%.4f",
+            spread, n, yes_fee, no_fee, guaranteed_profit,
+        )
+        return
     _log.info(
         "PURE ARB: ticker=%s, yes_ask=%.2f, no_ask=%.2f, spread=%.4f, n=%d, guaranteed_profit=%.2f",
         ticker, yes_ask, no_ask, spread, n, guaranteed_profit,
@@ -340,7 +357,7 @@ async def _evaluate_market(
     except ValueError:
         return None
 
-    if result.direction == "NONE" or result.net_edge < config.MIN_EDGE:
+    if result.direction == "NONE" or result.net_edge < result.min_edge_used:
         return None
 
     return {
@@ -380,7 +397,6 @@ async def _scan_markets(client: KalshiClient, session: aiohttp.ClientSession) ->
         balance = dashboard._current_balance
     else:
         dashboard.update_balance(balance)
-        state_manager.set_daily_start_balance(balance)
 
     if balance <= 0:
         _log.warning("Zero or negative balance — skipping scan.")

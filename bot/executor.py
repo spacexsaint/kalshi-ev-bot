@@ -84,8 +84,9 @@ async def _execute_live_order(
     price_cents: int,
     num_contracts: int,
     client_order_id: str,
+    action: str = "buy",
 ) -> FillResult:
-    order = await client.place_order(ticker, side, price_cents, num_contracts, client_order_id)
+    order = await client.place_order(ticker, side, price_cents, num_contracts, client_order_id, action=action)
     if order is None:
         return FillResult(False, 0.0, False, "", client_order_id)
 
@@ -388,6 +389,7 @@ async def close_position(
                 price_cents=current_bid_cents,
                 num_contracts=sell_contracts,
                 client_order_id=str(uuid.uuid4()),
+                action="sell",
             )
 
     state_manager.remove_position(client_order_id)
