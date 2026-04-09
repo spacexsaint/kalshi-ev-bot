@@ -245,6 +245,12 @@ def find_match(
     key = _cache_key(kalshi_ticker, best_candidate.source)
     with _cache_lock:
         _cache[key] = asdict(match)
+        # Evict oldest entries if cache exceeds max size to prevent unbounded growth.
+        # Keys are evicted FIFO (dict insertion order, Python 3.7+).
+        if len(_cache) > config.MATCH_CACHE_MAX_ENTRIES:
+            excess = len(_cache) - config.MATCH_CACHE_MAX_ENTRIES
+            for old_key in list(_cache.keys())[:excess]:
+                del _cache[old_key]
         snapshot = dict(_cache)  # Shallow copy for disk write
 
     # Disk I/O outside lock — non-blocking for other threads

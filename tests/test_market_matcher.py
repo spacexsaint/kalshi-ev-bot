@@ -411,3 +411,105 @@ class TestDetectIndex:
     def test_all_five_indices_covered(self):
         """INDEX_KEYWORDS must cover all 5 indices."""
         assert set(INDEX_KEYWORDS.keys()) == {"nasdaq", "sp500", "dow", "russell", "vix"}
+
+
+# ── Cache eviction tests (Agent C audit) ────────────────────────────────────
+
+class TestCacheEviction:
+    """
+    Regression: match cache must not grow without bound.
+    An ever-growing cache causes memory leaks on long-running bot sessions.
+    MATCH_CACHE_MAX_ENTRIES caps the in-memory dict; oldest entries are evicted FIFO.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self, tmp_path, monkeypatch):
+        import bot.config as cfg
+        monkeypatch.setattr(cfg, "MATCH_CACHE_FILE", str(tmp_path / "match_cache.json"))
+        monkeypatch.setattr(cfg, "LOW_CONF_LOG", str(tmp_path / "low_conf.jsonl"))
+        invalidate_cache()
+        yield
+        invalidate_cache()
+
+    def _make_candidate(self, title: str, source: str = "manifold") -> Candidate:
+        return Candidate(
+            title=title, probability=0.50,
+            close_date=None, source=source, market_id="test-id",
+        )
+
+    def test_config_has_max_entries(self):
+        """config.MATCH_CACHE_MAX_ENTRIES must exist and be positive."""
+        import bot.config as cfg
+        assert hasattr(cfg, "MATCH_CACHE_MAX_ENTRIES")
+        assert cfg.MATCH_CACHE_MAX_ENTRIES > 0
+
+    def test_cache_evicts_oldest_when_full(self, monkeypatch):
+        """
+        When cache exceeds MATCH_CACHE_MAX_ENTRIES, oldest entries are evicted.
+        """
+        import bot.config as cfg
+        import bot.market_matcher as mm
+
+        # Set a very small max to trigger eviction
+        monkeypatch.setattr(cfg, "MATCH_CACHE_MAX_ENTRIES", 3)
+
+        # Insert 5 matches by calling find_match with high-scoring mocked candidates
+        for i in range(5):
+            candidates = [self._make_candidate(f"Test market title number {i}")]
+            with patch("bot.market_matcher._compute_score", return_value=(0.90, 0.92, 0.86)):
+                find_match(
+                    kalshi_ticker=f"TICKER-{i}",
+                    kalshi_title=f"Test market title number {i}",
+                    kalshi_close_date=None,
+                    candidates=candidates,
+                )
+
+        # Cache should be capped at max_entries (3), not 5
+        with mm._cache_lock:
+            assert len(mm._cache) <= 3, (
+                f"Cache has {len(mm._cache)} entries but max is 3 — eviction not working"
+            )
+
+    def test_cache_key_is_ticker_based(self):
+        """Cache key must use ticker::source, not title (title collisions possible)."""
+        from bot.market_matcher import _cache_key
+        key = _cache_key("KXFED-26NOV", "predictit")
+        assert key == "KXFED-26NOV::predictit"
+        # Different tickers should produce different keys
+        key2 = _cache_key("KXFED-26DEC", "predictit")
+        assert key != key2
+
+
+# ── Aggregation edge cases (Agent C audit) ──────────────────────────────────
+
+class TestAggregationEdgeCases:
+    """Regression: edge cases in probability aggregation."""
+
+    def test_all_sources_none_returns_zero_count(self):
+        """When all sources are None, source_count must be 0."""
+        from bot.fair_value import _aggregate_probabilities
+        prob, count, names, mult = _aggregate_probabilities(None, None, None)
+        assert count == 0
+        assert names == []
+
+    def test_weight_renormalization_two_sources(self):
+        """With 2 of 3 sources, weights must renormalize to sum to 1.0."""
+        from bot.fair_value import _aggregate_probabilities
+        # PredictIt=0.60, Manifold=None, Polymarket=0.40
+        # Weights: predictit=0.50, polymarket=0.18 → renorm: 0.50/0.68, 0.18/0.68
+        prob, count, names, mult = _aggregate_probabilities(
+            predictit_prob=0.60, manifold_prob=None, polymarket_prob=0.40,
+        )
+        assert count == 2
+        expected_prob = (0.60 * 0.50 / 0.68) + (0.40 * 0.18 / 0.68)
+        assert abs(prob - expected_prob) < 1e-6
+
+    def test_disagreement_boundary_exactly_010(self):
+        """std exactly 0.10 should NOT trigger the penalty (>0.10 required)."""
+        from bot.fair_value import _compute_disagreement_mult
+        # Two values where std = exactly 0.10: [0.40, 0.60]
+        import numpy as np
+        probs = [0.40, 0.60]
+        assert abs(np.std(probs, ddof=0) - 0.10) < 1e-10
+        mult = _compute_disagreement_mult(probs)
+        assert mult == 1.0, "std == 0.10 should NOT trigger penalty (need >0.10)"

@@ -104,6 +104,7 @@ FUZZY_MATCH_THRESHOLD: float = 0.75
 FUZZY_LOW_CONF_MIN: float = 0.65
 DATE_MATCH_TOLERANCE_DAYS: int = 7
 MATCH_CACHE_TTL_HOURS: int = 6
+MATCH_CACHE_MAX_ENTRIES: int = 5000
 
 # ── API URLs ───────────────────────────────────────────────────────────────────
 KALSHI_BASE_URL_PROD: str = "https://api.elections.kalshi.com/trade-api/v2"
