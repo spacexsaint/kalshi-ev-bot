@@ -70,6 +70,7 @@ class BacktestTrade:
     ticker: str
     direction: str            # "YES" | "NO"
     entry_price: float
+    fair_prob: float           # Source-estimated fair probability (for Brier score)
     contracts: float
     stake_usd: float
     fee_usd: float
@@ -390,6 +391,7 @@ def _run_backtest(
             ticker=mkt.ticker,
             direction=direction,
             entry_price=entry_price,
+            fair_prob=mkt.fair_prob,
             contracts=float(num_contracts),
             stake_usd=actual_stake,
             fee_usd=fee,
@@ -638,24 +640,21 @@ def _compute_backtest_brier(result: BacktestResult, markets: List[HistoricalMark
     - 0.25: random (coin flip)
     - > 0.25: worse than random (sources are anti-correlated with outcomes)
 
-    We use the MARKET's fair_prob (from the matching source) as the probability,
-    and the actual resolution as the outcome. This measures source calibration.
+    Uses the trade's fair_prob (from external source aggregation), NOT the
+    market entry_price. This measures *source* calibration, which is what
+    determines whether the bot's edge estimates are accurate.
     """
     if not result.trades:
         return float('nan')
 
-    # For synthetic data, we inject fair_prob into the market objects
-    # The trade object has entry_price (proxy for market consensus) and resolved_yes
     scores = []
     for trade in result.trades:
-        # fair_prob estimated from the market: use resolution as ground truth
-        # For real backtest: trade.entry_price approximates market's probability
-        # Brier = (estimated_prob - actual_outcome)^2
-        # We need to pair trade back to its market's fair_prob
-        # Use entry_price as a proxy (the best we have in synthetic mode)
-        estimated_prob = trade.entry_price  # market price ≈ market's fair estimate
+        # For YES bets, fair_prob is the probability of YES resolving.
+        # For NO bets, we still use fair_prob (probability of YES) because
+        # the Brier score measures calibration of the probability estimate
+        # against the YES outcome (resolved_yes).
         outcome = 1.0 if trade.resolved_yes else 0.0
-        scores.append((estimated_prob - outcome) ** 2)
+        scores.append((trade.fair_prob - outcome) ** 2)
 
     return sum(scores) / len(scores)
 
