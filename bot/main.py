@@ -16,6 +16,7 @@ import asyncio
 import logging
 import math
 import os
+import signal
 import sys
 import time
 from datetime import datetime, timezone, timedelta
@@ -611,9 +612,19 @@ async def _daily_summary_loop(session: aiohttp.ClientSession) -> None:
 async def main_loop(single_cycle: bool = False) -> None:
     load_dotenv()
     _validate_env()
+    config.validate_config()
 
     os.makedirs(config.LOG_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(config.STATE_FILE), exist_ok=True)
+
+    # SIGTERM handler: graceful shutdown (same as KeyboardInterrupt)
+    def _handle_sigterm(signum, frame):
+        _log.info("Received SIGTERM — initiating graceful shutdown.")
+        state_manager.save()
+        bot_logger.log_event("shutdown", "Bot shut down via SIGTERM.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     state_manager.load()
     market_matcher.initialise()

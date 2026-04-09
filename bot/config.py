@@ -223,3 +223,41 @@ BRIER_LOG: str = "logs/brier_scores.jsonl"     # NEW: calibration tracking
 DASHBOARD_REFRESH_S: int = 30
 DAILY_SUMMARY_UTC_HOUR: int = 23
 DAILY_SUMMARY_UTC_MINUTE: int = 59
+
+
+# ── Config Validation ─────────────────────────────────────────────────────────
+
+def validate_config() -> None:
+    """Validate configuration parameters on startup. Raises ValueError on bad params."""
+    errors = []
+
+    if KELLY_FRACTION <= 0 or KELLY_FRACTION > 1.0:
+        errors.append(f"KELLY_FRACTION must be in (0, 1.0], got {KELLY_FRACTION}")
+    if MAX_BET_PCT <= 0 or MAX_BET_PCT > 1.0:
+        errors.append(f"MAX_BET_PCT must be in (0, 1.0], got {MAX_BET_PCT}")
+    if MIN_BET_USD < 0:
+        errors.append(f"MIN_BET_USD must be >= 0, got {MIN_BET_USD}")
+    if MAX_OPEN_POSITIONS < 1:
+        errors.append(f"MAX_OPEN_POSITIONS must be >= 1, got {MAX_OPEN_POSITIONS}")
+    if DAILY_LOSS_LIMIT_PCT <= 0 or DAILY_LOSS_LIMIT_PCT > 1.0:
+        errors.append(f"DAILY_LOSS_LIMIT_PCT must be in (0, 1.0], got {DAILY_LOSS_LIMIT_PCT}")
+    if SCAN_INTERVAL_SEC < 10:
+        errors.append(f"SCAN_INTERVAL_SEC must be >= 10, got {SCAN_INTERVAL_SEC}")
+    if PROFIT_TAKE_CENTS < 1:
+        errors.append(f"PROFIT_TAKE_CENTS must be >= 1, got {PROFIT_TAKE_CENTS}")
+    if STOP_LOSS_CENTS < 1:
+        errors.append(f"STOP_LOSS_CENTS must be >= 1, got {STOP_LOSS_CENTS}")
+    if STOP_LOSS_FRACTION <= 0 or STOP_LOSS_FRACTION >= 1.0:
+        errors.append(f"STOP_LOSS_FRACTION must be in (0, 1.0), got {STOP_LOSS_FRACTION}")
+    if FUZZY_MATCH_THRESHOLD < 0 or FUZZY_MATCH_THRESHOLD > 1.0:
+        errors.append(f"FUZZY_MATCH_THRESHOLD must be in [0, 1.0], got {FUZZY_MATCH_THRESHOLD}")
+    if MATCH_CACHE_MAX_ENTRIES < 1:
+        errors.append(f"MATCH_CACHE_MAX_ENTRIES must be >= 1, got {MATCH_CACHE_MAX_ENTRIES}")
+
+    # Source weights must sum to ~1.0
+    weight_sum = PREDICTIT_WEIGHT + MANIFOLD_WEIGHT + POLYMARKET_WEIGHT
+    if abs(weight_sum - 1.0) > 0.01:
+        errors.append(f"Source weights must sum to ~1.0, got {weight_sum:.3f}")
+
+    if errors:
+        raise ValueError("Config validation failed:\n  " + "\n  ".join(errors))
