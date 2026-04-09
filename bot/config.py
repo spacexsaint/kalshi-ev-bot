@@ -174,6 +174,10 @@ CATEGORY_SOURCE_WEIGHTS: dict = {
     "crypto": {
         "predictit": 0.05, "manifold": 0.30, "polymarket": 0.65, "metaculus": 0.00,
     },
+    "nasdaq": {
+        # Financial markets: similar to S&P 500
+        "predictit": 0.40, "manifold": 0.35, "polymarket": 0.20, "metaculus": 0.05,
+    },
     "sp500": {
         # Financial markets: Manifold + PredictIt both decent
         "predictit": 0.40, "manifold": 0.35, "polymarket": 0.20, "metaculus": 0.05,

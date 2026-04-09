@@ -101,6 +101,23 @@ def _make_auth_headers(
     }
 
 
+# ── Consecutive 5xx tracking (emergency stop) ─────────────────────────────────
+_consecutive_5xx: int = 0
+_EMERGENCY_5XX_THRESHOLD: int = 3
+_EMERGENCY_PAUSE_S: int = 300  # 5-minute pause after 3 consecutive 5xx
+
+
+def get_consecutive_5xx() -> int:
+    """Return the current consecutive 5xx error count (for testing)."""
+    return _consecutive_5xx
+
+
+def reset_consecutive_5xx() -> None:
+    """Reset the consecutive 5xx counter (e.g. after a successful request)."""
+    global _consecutive_5xx
+    _consecutive_5xx = 0
+
+
 # ── Retry logic ────────────────────────────────────────────────────────────────
 
 async def _request_with_retry(
@@ -121,8 +138,25 @@ async def _request_with_retry(
     Server error (5xx): wait 10 seconds then retry.
     Max 3 retries with backoff: 1s, 2s, 4s.
     """
+    global _consecutive_5xx
     parsed = urlparse(url)
     path = parsed.path  # Already the full path from root e.g. /trade-api/v2/...
+
+    # Emergency stop: if we've seen N consecutive 5xx across all requests,
+    # pause trading to avoid sending orders into a degraded API.
+    if _consecutive_5xx >= _EMERGENCY_5XX_THRESHOLD:
+        _log.error(
+            "EMERGENCY PAUSE: %d consecutive 5xx errors. Pausing %ds before retrying.",
+            _consecutive_5xx, _EMERGENCY_PAUSE_S,
+        )
+        bot_logger.log_event(
+            "emergency_pause",
+            f"API emergency pause: {_consecutive_5xx} consecutive 5xx errors",
+            extra={"consecutive_5xx": _consecutive_5xx, "pause_seconds": _EMERGENCY_PAUSE_S},
+            severity="error",
+        )
+        await asyncio.sleep(_EMERGENCY_PAUSE_S)
+        _consecutive_5xx = 0  # Reset after pause
 
     for attempt in range(max_retries + 1):
         t0 = time.monotonic()
@@ -151,6 +185,7 @@ async def _request_with_retry(
                 )
 
                 if status in (200, 201, 204):
+                    _consecutive_5xx = 0  # Reset on success
                     if status == 204:
                         return {}
                     return await resp.json(content_type=None)
@@ -162,8 +197,10 @@ async def _request_with_retry(
                     continue
 
                 if 500 <= status < 600:
+                    _consecutive_5xx += 1
                     wait = config.SERVER_ERROR_WAIT_S * (2 ** attempt)
-                    _log.warning("Server error %d. Waiting %ds before retry.", status, wait)
+                    _log.warning("Server error %d (consecutive: %d). Waiting %ds before retry.",
+                                 status, _consecutive_5xx, wait)
                     await asyncio.sleep(wait)
                     continue
 

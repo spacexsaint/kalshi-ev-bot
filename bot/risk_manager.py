@@ -56,6 +56,7 @@ _CATEGORY_PATTERNS: Dict[str, List[str]] = {
     "nba": ["nba", "basketball", "finals", "lakers", "celtics", "warriors"],
     "nfl": ["nfl", "football", "super bowl", "chiefs", "eagles"],
     "mlb": ["mlb", "baseball", "world series"],
+    "nasdaq": ["nasdaq", "nasdaq100", "qqq", "nasdaq-100"],
     "sp500": ["s&p", "sp500", "inx", "stock market"],
     "gdp": ["gdp", "recession", "growth"],
     "tech": ["microsoft", "apple", "google", "amazon", "meta", "tesla", "nvidia", "semiconductor"],
