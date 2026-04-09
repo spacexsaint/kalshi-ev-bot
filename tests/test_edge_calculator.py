@@ -211,11 +211,20 @@ class TestComputeEdge:
         if result.direction != "NONE":
             assert result.stake_usd <= config.MAX_BET_PCT * balance + 0.01
 
-    def test_stake_floored_at_min_bet(self):
+    def test_min_bet_produces_at_least_one_contract(self):
+        """
+        MIN_BET_USD is the minimum BUDGET, not a floor on actual cost.
+        With a tiny balance, the budget floors to 1.00 but actual cost
+        is 1 contract * price + fee (may be < $1.00 at low prices).
+        The important thing: contracts >= 1 so a real order is placed.
+        """
         balance = 10.0
         result = compute_edge(w=0.70, p=0.55, q=0.48, balance=balance)
         if result.direction != "NONE":
-            assert result.stake_usd >= config.MIN_BET_USD
+            assert result.contracts >= 1, "Must place at least 1 contract"
+            # Actual cost = contracts * price + fee (may differ from MIN_BET_USD)
+            actual_cost = result.contracts * result.exec_price + result.fee_usd
+            assert actual_cost <= result.stake_usd + 0.01, "Cost must not exceed stake budget"
 
 
 # ── EdgeResult new fields ──────────────────────────────────────────────────────
@@ -231,6 +240,7 @@ class TestEdgeResultFields:
         assert hasattr(result, "source_count")
         assert hasattr(result, "exec_price")
         assert hasattr(result, "market_price")
+        assert hasattr(result, "contracts")   # New: pre-computed fee-aware contracts
 
     def test_uncertainty_mult_stored(self):
         r1 = compute_edge(w=0.70, p=0.55, q=0.48, balance=1000.0, source_count=1)

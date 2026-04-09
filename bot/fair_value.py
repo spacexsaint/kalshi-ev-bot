@@ -1,41 +1,39 @@
 """
 fair_value.py — Aggregate fair-value probability from PredictIt + Manifold + Polymarket.
 
-═══════════════════════════════════════════════════════════════════
-AUDIT IMPROVEMENTS (2026-04-08):
-═══════════════════════════════════════════════════════════════════
+SOURCES (all free, no auth for reads):
+  PredictIt:  GET https://www.predictit.org/api/marketdata/all/
+              probability = contract["bestBuyYesCost"]
+              Calibration: 93% accuracy (Vanderbilt 2026) — BEST on politics
+  Manifold:   GET https://api.manifold.markets/v0/markets?limit=1000&filter=open
+              probability = market["probability"]
+              Calibration: well-calibrated (arXiv 2025) — BEST on tech/science/general
+  Polymarket: GET https://gamma-api.polymarket.com/markets?active=true&closed=false
+              probability = market["outcomePrices"][0] (YES price)
+              Calibration: 67% accuracy (Vanderbilt 2026) — BEST on sports/crypto
 
-[NEW] SOURCE 3 — Polymarket (gamma-api.polymarket.com):
-  $40M documented arb profits extracted 2024-2025. High-volume,
-  CFTC-regulated. No auth for reads. Essential for politics/sports.
+AGGREGATION:
+  Uses category-specific weights from config.CATEGORY_SOURCE_WEIGHTS when category
+  is recognised (e.g., "election" → PredictIt 60%, "btc" → Polymarket 65%).
+  Falls back to global weights for uncategorised markets.
+  Renormalises weights for whichever sources are actually available.
 
-[FIXED] Source weighting — now calibration-derived (Vanderbilt 2026):
-  PredictIt:  0.45  (93% accuracy — gold standard)
-  Manifold:   0.35  (well-calibrated per arXiv 2025)
-  Polymarket: 0.20  (67% accuracy — useful signal, lowest weight)
-  PREVIOUS (WRONG): Manifold 0.60, PredictIt 0.40
-
-[IMPROVED] Confidence reporting: "triple" | "dual" | "single" | "none"
-
-[IMPROVED] Category detection: tag-based topic extraction from Polymarket
-  market tags → used for correlation-aware position sizing in risk_manager.
-
-═══════════════════════════════════════════════════════════════════
-
-SOURCE DOCS:
-  PredictIt: https://www.predictit.org/api/marketdata/all/
-  Manifold:  https://docs.manifold.markets/api
-  Polymarket: https://docs.polymarket.com/market-data/overview (no auth for Gamma API)
+CONFIDENCE:
+  "triple" = all 3 sources matched
+  "dual"   = 2 sources matched
+  "single" = 1 source matched
+  None returned if 0 sources matched (never trade blind)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Literal, Optional, Set
+from typing import Dict, List, Literal, Optional
 
 import aiohttp
 
@@ -48,32 +46,28 @@ _log = logging.getLogger(__name__)
 
 @dataclass
 class FairValue:
-    probability: float                                   # 0–1 aggregated fair probability
+    probability: float
     confidence: Literal["triple", "dual", "single", "none"]
-    sources: List[str]                                   # e.g. ["predictit","manifold","polymarket"]
-    source_count: int                                    # Number of sources that matched
+    sources: List[str]
+    source_count: int
+    category: str = "uncategorized"
     predictit_prob: Optional[float] = None
     manifold_prob: Optional[float] = None
     polymarket_prob: Optional[float] = None
     predictit_match_score: Optional[float] = None
     manifold_match_score: Optional[float] = None
     polymarket_match_score: Optional[float] = None
-    category_tags: List[str] = field(default_factory=list)  # For correlation detection
 
 
-# ── Module-level market caches ─────────────────────────────────────────────────
-
+# ── Module-level caches ────────────────────────────────────────────────────────
 _manifold_cache: List[Candidate] = []
 _predictit_cache: List[Candidate] = []
 _polymarket_cache: List[Candidate] = []
-_manifold_fetched_at: Optional[float] = None
-_predictit_fetched_at: Optional[float] = None
-_polymarket_fetched_at: Optional[float] = None
+_fetched_at: Optional[float] = None
 _CACHE_TTL_S: float = 290.0
 
 
 # ── HTTP helper ────────────────────────────────────────────────────────────────
-
 async def _get_json(
     session: aiohttp.ClientSession,
     url: str,
@@ -82,55 +76,36 @@ async def _get_json(
     t0 = time.monotonic()
     try:
         async with session.get(
-            url,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=30),
+            url, params=params, timeout=aiohttp.ClientTimeout(total=30)
         ) as resp:
-            latency_ms = (time.monotonic() - t0) * 1000
             bot_logger.log_api_call(
-                method="GET",
-                endpoint=url,
+                method="GET", endpoint=url,
                 status_code=resp.status,
-                latency_ms=latency_ms,
+                latency_ms=(time.monotonic() - t0) * 1000,
             )
             if resp.status == 200:
                 return await resp.json(content_type=None)
             _log.warning("HTTP %s from %s", resp.status, url)
             return None
     except Exception as exc:
-        latency_ms = (time.monotonic() - t0) * 1000
         bot_logger.log_api_call(
-            method="GET",
-            endpoint=url,
-            status_code=0,
-            latency_ms=latency_ms,
-            error=str(exc),
+            method="GET", endpoint=url, status_code=0,
+            latency_ms=(time.monotonic() - t0) * 1000, error=str(exc),
         )
-        _log.error("Request failed for %s: %s", url, exc)
         return None
 
 
 # ── SOURCE 1: PredictIt ────────────────────────────────────────────────────────
-
-async def _fetch_predictit_markets(session: aiohttp.ClientSession) -> List[Candidate]:
-    """
-    Fetch open binary markets from PredictIt.
-    Calibration leader: 93% accuracy (Vanderbilt 2026) — highest weight.
-
-    AUDIT: Weight INCREASED from 0.40 → 0.45.
-    """
+async def _fetch_predictit(session: aiohttp.ClientSession) -> List[Candidate]:
     data = await _get_json(session, config.PREDICTIT_URL)
     if not data or not isinstance(data, dict):
         return []
-
     candidates: List[Candidate] = []
     for market in data.get("markets", []):
         if market.get("status", "").lower() != "open":
             continue
-
         contracts = market.get("contracts", [])
         for contract in contracts:
-            # Use bestBuyYesCost as primary (live orderbook best ask for YES)
             prob = contract.get("bestBuyYesCost") or contract.get("lastTradePrice")
             if prob is None:
                 continue
@@ -140,347 +115,240 @@ async def _fetch_predictit_markets(session: aiohttp.ClientSession) -> List[Candi
                 continue
             if not (0.0 < prob < 1.0):
                 continue
-
             title = (
-                market.get("name", "")
-                if len(contracts) == 1
+                market.get("name", "") if len(contracts) == 1
                 else f"{market.get('name', '')} — {contract.get('name', '')}"
             )
-
             close_dt: Optional[datetime] = None
-            end_date = contract.get("dateEnd")
-            if end_date and end_date != "NA":
+            end = contract.get("dateEnd")
+            if end and end != "NA":
                 try:
-                    close_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                    close_dt = datetime.fromisoformat(str(end).replace("Z", "+00:00"))
                 except (ValueError, AttributeError):
                     pass
-
             candidates.append(Candidate(
-                title=title,
-                probability=prob,
-                close_date=close_dt,
-                source="predictit",
-                market_id=f"{market.get('id', '')}:{contract.get('id', '')}",
+                title=title, probability=prob, close_date=close_dt,
+                source="predictit", market_id=f"{market.get('id')}:{contract.get('id')}",
             ))
-
     _log.info("Fetched %d PredictIt markets", len(candidates))
     return candidates
 
 
-# ── SOURCE 2: Manifold ────────────────────────────────────────────────────────
-
-async def _fetch_manifold_markets(session: aiohttp.ClientSession) -> List[Candidate]:
-    """
-    Fetch open binary markets from Manifold.
-    Well-calibrated per arXiv 2025 study. Weight: 0.35.
-
-    AUDIT: Weight DECREASED from 0.60 → 0.35.
-    """
+# ── SOURCE 2: Manifold ─────────────────────────────────────────────────────────
+async def _fetch_manifold(session: aiohttp.ClientSession) -> List[Candidate]:
     candidates: List[Candidate] = []
     cursor: Optional[str] = None
-
     while True:
-        params: dict = {
-            "limit": 1000,
-            "filter": "open",
-            "contractType": "BINARY",
-            "sort": "created-time",
-            "order": "desc",
-        }
+        params: dict = {"limit": 1000, "filter": "open", "contractType": "BINARY",
+                        "sort": "created-time", "order": "desc"}
         if cursor:
             params["before"] = cursor
-
-        data = await _get_json(
-            session,
-            f"{config.MANIFOLD_BASE_URL}/markets",
-            params=params,
-        )
+        data = await _get_json(session, f"{config.MANIFOLD_BASE_URL}/markets", params=params)
         if not data or not isinstance(data, list):
             break
-
-        for market in data:
-            prob = market.get("probability")
-            if prob is None or market.get("isResolved"):
+        for m in data:
+            prob = m.get("probability")
+            if prob is None or m.get("isResolved"):
                 continue
-
-            close_time = market.get("closeTime")
             close_dt: Optional[datetime] = None
-            if close_time:
+            ct = m.get("closeTime")
+            if ct:
                 try:
-                    close_dt = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc)
+                    close_dt = datetime.fromtimestamp(ct / 1000, tz=timezone.utc)
                 except (TypeError, ValueError, OSError):
                     pass
-
             candidates.append(Candidate(
-                title=market.get("question", ""),
-                probability=float(prob),
-                close_date=close_dt,
-                source="manifold",
-                market_id=market.get("id", ""),
+                title=m.get("question", ""), probability=float(prob),
+                close_date=close_dt, source="manifold", market_id=m.get("id", ""),
             ))
-
         if len(data) < 1000:
             break
         cursor = data[-1].get("id")
-
-    _log.info("Fetched %d Manifold binary markets", len(candidates))
+    _log.info("Fetched %d Manifold markets", len(candidates))
     return candidates
 
 
-# ── SOURCE 3: Polymarket ──────────────────────────────────────────────────────
-
-async def _fetch_polymarket_markets(session: aiohttp.ClientSession) -> List[Candidate]:
-    """
-    Fetch active binary markets from Polymarket Gamma API.
-
-    SOURCE: https://docs.polymarket.com/market-data/overview
-    Endpoint: GET https://gamma-api.polymarket.com/markets?active=true&closed=false
-    No auth required. Rate limit: 300 req / 10s.
-
-    Probability: market["outcomePrices"] — JSON array, index 0 = YES price.
-    Resolution date: market["endDate"] (ISO 8601).
-
-    [NEW] Polymarket added as 3rd source:
-    - $40M documented arb profits Kalshi vs Polymarket 2024-2025
-    - Critical for politics and sports markets
-    - Weight: 0.20 (lowest — 67% accuracy per Vanderbilt 2026)
-    """
+# ── SOURCE 3: Polymarket ───────────────────────────────────────────────────────
+async def _fetch_polymarket(session: aiohttp.ClientSession) -> List[Candidate]:
     candidates: List[Candidate] = []
     offset = 0
-    limit = 100
-
     while True:
-        params = {
-            "active": "true",
-            "closed": "false",
-            "limit": limit,
-            "offset": offset,
-            "order": "volume_24hr",
-            "ascending": "false",
-        }
         data = await _get_json(
             session,
             f"{config.POLYMARKET_GAMMA_URL}/markets",
-            params=params,
+            params={"active": "true", "closed": "false", "limit": 100,
+                    "offset": offset, "order": "volume_24hr", "ascending": "false"},
         )
         if not data or not isinstance(data, list):
             break
-
         for market in data:
-            # Only binary markets (YES/NO)
             outcomes_raw = market.get("outcomes", "")
             try:
-                import json as _json
                 outcomes = _json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
             except Exception:
                 outcomes = []
-
             if not outcomes or len(outcomes) != 2:
                 continue
-
-            # outcomePrices is a JSON string or list of price strings
             prices_raw = market.get("outcomePrices", "")
             try:
                 prices = _json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
                 yes_price = float(prices[0]) if prices else None
-            except (Exception, IndexError):
+            except Exception:
                 yes_price = None
-
-            # Fallback to lastTradePrice
             if yes_price is None:
-                yes_price = market.get("lastTradePrice")
-
-            if yes_price is None:
-                continue
-            try:
-                yes_price = float(yes_price)
-            except (TypeError, ValueError):
-                continue
-
-            if not (0.0 < yes_price < 1.0):
-                continue
-
-            # End date
-            close_dt: Optional[datetime] = None
-            end_date = market.get("endDate") or market.get("endDateIso")
-            if end_date:
+                ltp = market.get("lastTradePrice")
                 try:
-                    close_dt = datetime.fromisoformat(
-                        str(end_date).replace("Z", "+00:00")
-                    )
-                except (ValueError, AttributeError):
+                    yes_price = float(ltp) if ltp is not None else None
+                except (TypeError, ValueError):
                     pass
-
-            # Tags for correlation detection
-            tags: List[str] = []
-            market_tags = market.get("tags", [])
-            if isinstance(market_tags, list):
-                for t in market_tags:
-                    label = t.get("label", "") if isinstance(t, dict) else str(t)
-                    if label:
-                        tags.append(label.lower())
-
-            c = Candidate(
+            if yes_price is None or not (0.0 < yes_price < 1.0):
+                continue
+            close_dt: Optional[datetime] = None
+            for df in ["endDate", "endDateIso"]:
+                if market.get(df):
+                    try:
+                        close_dt = datetime.fromisoformat(str(market[df]).replace("Z", "+00:00"))
+                        break
+                    except (ValueError, AttributeError):
+                        pass
+            candidates.append(Candidate(
                 title=market.get("question", market.get("title", "")),
-                probability=yes_price,
-                close_date=close_dt,
-                source="polymarket",
-                market_id=str(market.get("id", "")),
-            )
-            # Attach tags as metadata via a subclass or by storing separately
-            # (market_matcher.Candidate doesn't have tags; track in separate dict)
-            candidates.append(c)
-
-        if len(data) < limit:
+                probability=yes_price, close_date=close_dt,
+                source="polymarket", market_id=str(market.get("id", "")),
+            ))
+        if len(data) < 100 or offset >= 2000:
             break
-        offset += limit
-
-        # Limit total fetches to avoid rate limits
-        if offset >= 2000:
-            break
-
-    _log.info("Fetched %d Polymarket binary markets", len(candidates))
+        offset += 100
+    _log.info("Fetched %d Polymarket markets", len(candidates))
     return candidates
 
 
-# ── Cache refresh ──────────────────────────────────────────────────────────────
-
+# ── Cache management ───────────────────────────────────────────────────────────
 async def refresh_all_sources(session: aiohttp.ClientSession) -> None:
-    """Fetch fresh data from all three sources concurrently."""
-    global _predictit_cache, _manifold_cache, _polymarket_cache
-    global _predictit_fetched_at, _manifold_fetched_at, _polymarket_fetched_at
-
+    global _predictit_cache, _manifold_cache, _polymarket_cache, _fetched_at
     predictit, manifold, polymarket = await asyncio.gather(
-        _fetch_predictit_markets(session),
-        _fetch_manifold_markets(session),
-        _fetch_polymarket_markets(session),
+        _fetch_predictit(session),
+        _fetch_manifold(session),
+        _fetch_polymarket(session),
     )
-
     _predictit_cache = predictit
     _manifold_cache = manifold
     _polymarket_cache = polymarket
-    now = time.monotonic()
-    _predictit_fetched_at = _manifold_fetched_at = _polymarket_fetched_at = now
+    _fetched_at = time.monotonic()
 
 
 def _caches_valid() -> bool:
-    if any(t is None for t in [_predictit_fetched_at, _manifold_fetched_at, _polymarket_fetched_at]):
-        return False
-    oldest = min(_predictit_fetched_at, _manifold_fetched_at, _polymarket_fetched_at)  # type: ignore
-    return (time.monotonic() - oldest) < _CACHE_TTL_S
+    return _fetched_at is not None and (time.monotonic() - _fetched_at) < _CACHE_TTL_S
 
 
-# ── Calibration-weighted aggregation ──────────────────────────────────────────
-
-def _aggregate_probabilities(
-    predictit_prob: Optional[float],
-    manifold_prob: Optional[float],
-    polymarket_prob: Optional[float],
-) -> tuple[float, int, List[str]]:
+# ── Category-aware aggregation ─────────────────────────────────────────────────
+def _get_weights_for_category(category: str) -> Dict[str, float]:
     """
-    Aggregate probabilities using calibration-derived weights.
+    Return source weights for a given market category.
 
-    Weights (Vanderbilt 2026 + Calibration City):
-      PredictIt:  0.45 (93% accuracy)
-      Manifold:   0.35 (well-calibrated)
-      Polymarket: 0.20 (67% accuracy)
-
-    Normalises weights for whichever sources are available.
-    Returns: (aggregated_probability, source_count, source_names)
+    Uses config.CATEGORY_SOURCE_WEIGHTS if category is recognised,
+    otherwise falls back to global weights.
     """
-    sources: Dict[str, float] = {}
-    if predictit_prob is not None:
-        sources["predictit"] = predictit_prob
-    if manifold_prob is not None:
-        sources["manifold"] = manifold_prob
-    if polymarket_prob is not None:
-        sources["polymarket"] = polymarket_prob
-
-    if not sources:
-        return 0.0, 0, []
-
-    # Weight map
-    weight_map = {
+    cat_weights = config.CATEGORY_SOURCE_WEIGHTS.get(category)
+    if cat_weights:
+        return cat_weights
+    return {
         "predictit": config.PREDICTIT_WEIGHT,
         "manifold": config.MANIFOLD_WEIGHT,
         "polymarket": config.POLYMARKET_WEIGHT,
     }
 
-    total_weight = sum(weight_map[s] for s in sources)
-    if total_weight == 0:
+
+def _aggregate_probabilities(
+    predictit_prob: Optional[float],
+    manifold_prob: Optional[float],
+    polymarket_prob: Optional[float],
+    category: str = "uncategorized",
+) -> tuple[float, int, List[str]]:
+    """
+    Weighted aggregation using category-specific calibration weights.
+
+    Weights are renormalised to sum to 1.0 over whichever sources matched.
+    Returns: (probability, source_count, source_names)
+    """
+    available: Dict[str, float] = {}
+    if predictit_prob is not None:
+        available["predictit"] = predictit_prob
+    if manifold_prob is not None:
+        available["manifold"] = manifold_prob
+    if polymarket_prob is not None:
+        available["polymarket"] = polymarket_prob
+
+    if not available:
         return 0.0, 0, []
 
+    weight_map = _get_weights_for_category(category)
+
+    # Renormalise to only present sources
+    total_w = sum(weight_map.get(src, 0.0) for src in available)
+    if total_w <= 0:
+        # Equal weighting fallback
+        prob = sum(available.values()) / len(available)
+        return prob, len(available), list(available.keys())
+
     weighted_prob = sum(
-        prob * weight_map[source] / total_weight
-        for source, prob in sources.items()
+        prob * weight_map.get(src, 0.0) / total_w
+        for src, prob in available.items()
     )
+    return weighted_prob, len(available), list(available.keys())
 
-    return weighted_prob, len(sources), list(sources.keys())
 
-
-# ── Main entry-point ───────────────────────────────────────────────────────────
-
+# ── Main entry point ───────────────────────────────────────────────────────────
 async def get_fair_value(
     kalshi_ticker: str,
     kalshi_title: str,
     kalshi_close_date: Optional[datetime],
     session: aiohttp.ClientSession,
+    category: str = "uncategorized",
 ) -> Optional[FairValue]:
     """
-    Get aggregated fair-value probability for a Kalshi market.
+    Get calibration-weighted fair probability for a Kalshi market.
 
-    Fetches from PredictIt, Manifold, and Polymarket (cached within scan cycle),
-    fuzzy-matches titles, and aggregates with calibration-derived weights.
-
-    Returns:
-        FairValue with probability, confidence, and source metadata.
-        None if no source matches (do NOT trade blind).
+    Uses category-specific weights so that:
+    - Elections use PredictIt-dominant weighting
+    - Sports/crypto use Polymarket-dominant weighting
+    - Tech/science use Manifold-dominant weighting
+    - Returns None if no source matches (never trade blind)
     """
     if not _caches_valid():
         await refresh_all_sources(session)
 
-    # Match against all three sources in parallel
     predictit_match: Optional[Match] = find_match(
-        kalshi_ticker=kalshi_ticker,
-        kalshi_title=kalshi_title,
-        kalshi_close_date=kalshi_close_date,
-        candidates=_predictit_cache,
-    )
+        kalshi_ticker, kalshi_title, kalshi_close_date, _predictit_cache)
     manifold_match: Optional[Match] = find_match(
-        kalshi_ticker=kalshi_ticker,
-        kalshi_title=kalshi_title,
-        kalshi_close_date=kalshi_close_date,
-        candidates=_manifold_cache,
-    )
+        kalshi_ticker, kalshi_title, kalshi_close_date, _manifold_cache)
     polymarket_match: Optional[Match] = find_match(
-        kalshi_ticker=kalshi_ticker,
-        kalshi_title=kalshi_title,
-        kalshi_close_date=kalshi_close_date,
-        candidates=_polymarket_cache,
-    )
+        kalshi_ticker, kalshi_title, kalshi_close_date, _polymarket_cache)
 
     predictit_prob = predictit_match.candidate.probability if predictit_match else None
     manifold_prob = manifold_match.candidate.probability if manifold_match else None
     polymarket_prob = polymarket_match.candidate.probability if polymarket_match else None
 
     aggregated, source_count, source_names = _aggregate_probabilities(
-        predictit_prob, manifold_prob, polymarket_prob
+        predictit_prob, manifold_prob, polymarket_prob, category
     )
 
     if source_count == 0:
         return None
 
-    # Confidence label
+    confidence: Literal["triple", "dual", "single", "none"]
     if source_count >= 3:
-        confidence: Literal["triple", "dual", "single", "none"] = "triple"
+        confidence = "triple"
     elif source_count == 2:
         confidence = "dual"
     else:
         confidence = "single"
         bot_logger.log_event(
             "single_source",
-            f"Only {source_names[0]} matched for {kalshi_ticker} ({kalshi_title[:60]})",
-            extra={"ticker": kalshi_ticker, "source": source_names[0], "prob": aggregated},
+            f"Only {source_names[0]} matched for {kalshi_ticker}",
+            extra={"ticker": kalshi_ticker, "source": source_names[0],
+                   "prob": aggregated, "category": category},
+            severity="warning",
         )
 
     return FairValue(
@@ -488,6 +356,7 @@ async def get_fair_value(
         confidence=confidence,
         sources=source_names,
         source_count=source_count,
+        category=category,
         predictit_prob=predictit_prob,
         manifold_prob=manifold_prob,
         polymarket_prob=polymarket_prob,
@@ -498,24 +367,12 @@ async def get_fair_value(
 
 
 async def test_connectivity(session: aiohttp.ClientSession) -> Dict[str, bool]:
-    """Lightweight connectivity check for startup validation."""
     results: Dict[str, bool] = {}
-
-    data1 = await _get_json(
-        session,
-        f"{config.MANIFOLD_BASE_URL}/markets",
-        params={"limit": 1},
-    )
-    results["manifold"] = isinstance(data1, list)
-
-    data2 = await _get_json(session, config.PREDICTIT_URL)
-    results["predictit"] = isinstance(data2, dict) and "markets" in data2
-
-    data3 = await _get_json(
-        session,
-        f"{config.POLYMARKET_GAMMA_URL}/markets",
-        params={"active": "true", "closed": "false", "limit": 1},
-    )
-    results["polymarket"] = isinstance(data3, list)
-
+    d1 = await _get_json(session, f"{config.MANIFOLD_BASE_URL}/markets", {"limit": 1})
+    results["manifold"] = isinstance(d1, list)
+    d2 = await _get_json(session, config.PREDICTIT_URL)
+    results["predictit"] = isinstance(d2, dict) and "markets" in d2
+    d3 = await _get_json(session, f"{config.POLYMARKET_GAMMA_URL}/markets",
+                         {"active": "true", "closed": "false", "limit": 1})
+    results["polymarket"] = isinstance(d3, list)
     return results

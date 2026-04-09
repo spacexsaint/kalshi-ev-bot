@@ -1,23 +1,25 @@
 """
-market_matcher.py — Fuzzy title matching between Kalshi and Manifold/PredictIt.
+market_matcher.py — Fuzzy title matching between Kalshi and external sources.
 
 Algorithm:
   1. Preprocess: lowercase, strip punctuation, normalize whitespace
   2. Primary score: token_sort_ratio (handles word-order differences)
-  3. Secondary score: partial_ratio
+  3. Secondary: partial_ratio
   4. Final score = 0.7 × token_sort_ratio + 0.3 × partial_ratio
-  5. Only return a match if final_score >= FUZZY_MATCH_THRESHOLD (0.75)
-  6. Additionally validate: resolution dates within 7 days of each other
-  7. Scores in [0.65, 0.74) → log to low_confidence_matches.jsonl, return None
-  8. Cache all matches in /data/match_cache.json (refresh every 6 hours)
+  5. Match if final_score >= FUZZY_MATCH_THRESHOLD (0.75)
+  6. Date validation: resolution dates within DATE_MATCH_TOLERANCE_DAYS
+  7. Scores in [FUZZY_LOW_CONF_MIN, FUZZY_MATCH_THRESHOLD): log, don't trade
+  8. Cache in data/match_cache.json, TTL = MATCH_CACHE_TTL_HOURS
 
-Uses rapidfuzz library (pip install rapidfuzz).
+FIX (2026-04-09): Cache file I/O is now done OUTSIDE the lock scope.
+  Previously _save_cache() was called while holding _cache_lock, meaning
+  any slow disk flush (>50ms) blocked all concurrent find_match threads.
+  Fix: copy the data under the lock, release the lock, then write to disk.
 """
 
 import json
 import os
 import re
-import string
 import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
@@ -31,17 +33,15 @@ from bot import logger
 
 @dataclass
 class Candidate:
-    """A market from an external source (Manifold or PredictIt)."""
     title: str
-    probability: float               # 0–1
-    close_date: Optional[datetime]   # None if unknown
-    source: str                      # "manifold" | "predictit"
-    market_id: str                   # External market identifier
+    probability: float
+    close_date: Optional[datetime]
+    source: str
+    market_id: str
 
 
 @dataclass
 class Match:
-    """A confirmed match between a Kalshi market and an external candidate."""
     kalshi_title: str
     kalshi_ticker: str
     kalshi_close_date: Optional[datetime]
@@ -54,11 +54,12 @@ class Match:
 
 # ── Cache ──────────────────────────────────────────────────────────────────────
 _cache_lock = threading.Lock()
-_cache: Dict[str, dict] = {}       # key → serialised Match dict
+_cache: Dict[str, dict] = {}
 _cache_loaded_at: Optional[datetime] = None
 
 
 def _load_cache() -> None:
+    """Load cache from disk. Must be called with _cache_lock held."""
     global _cache, _cache_loaded_at
     path = config.MATCH_CACHE_FILE
     if not os.path.exists(path):
@@ -74,81 +75,73 @@ def _load_cache() -> None:
         _cache_loaded_at = None
 
 
-def _save_cache() -> None:
+def _save_cache_to_disk(snapshot: dict) -> None:
+    """
+    Write cache snapshot to disk. Called WITHOUT holding _cache_lock.
+
+    Uses atomic write (write to .tmp, then os.replace) so readers never
+    see a partial file. Lock is released before I/O to avoid blocking
+    concurrent find_match calls during slow disk flushes.
+    """
     path = config.MATCH_CACHE_FILE
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-                "matches": _cache,
-            },
-            fh,
-            indent=2,
-            default=str,
-        )
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"updated_at": datetime.now(timezone.utc).isoformat(), "matches": snapshot},
+                fh, indent=2, default=str,
+            )
+        os.replace(tmp, path)
+    except OSError:
+        pass  # Non-fatal — cache is in memory, disk write is best-effort
 
 
 def _cache_is_stale() -> bool:
+    """Must be called with _cache_lock held."""
     if _cache_loaded_at is None:
         return True
-    age = datetime.now(timezone.utc) - _cache_loaded_at
-    return age > timedelta(hours=config.MATCH_CACHE_TTL_HOURS)
+    return datetime.now(timezone.utc) - _cache_loaded_at > timedelta(hours=config.MATCH_CACHE_TTL_HOURS)
 
 
-def _cache_key(kalshi_ticker: str, source: str) -> str:
-    return f"{kalshi_ticker}::{source}"
+def _cache_key(ticker: str, source: str) -> str:
+    return f"{ticker}::{source}"
 
 
 # ── Text preprocessing ─────────────────────────────────────────────────────────
-
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WS_RE = re.compile(r"\s+")
 
 
 def _preprocess(title: str) -> str:
-    """Lowercase → strip punctuation → collapse whitespace."""
-    lowered = title.lower()
-    no_punct = _PUNCT_RE.sub(" ", lowered)
-    normalised = _WS_RE.sub(" ", no_punct).strip()
-    return normalised
+    return _WS_RE.sub(" ", _PUNCT_RE.sub(" ", title.lower())).strip()
 
 
 # ── Date validation ────────────────────────────────────────────────────────────
-
 def _dates_compatible(
-    kalshi_close: Optional[datetime],
-    candidate_close: Optional[datetime],
+    a: Optional[datetime],
+    b: Optional[datetime],
     tolerance_days: int = config.DATE_MATCH_TOLERANCE_DAYS,
 ) -> bool:
-    """Return True if dates are within tolerance or either is unknown."""
-    if kalshi_close is None or candidate_close is None:
-        return True   # Can't invalidate what we don't know
-    diff = abs((kalshi_close - candidate_close).total_seconds())
-    return diff <= tolerance_days * 86_400
+    if a is None or b is None:
+        return True
+    return abs((a - b).total_seconds()) <= tolerance_days * 86_400
 
 
 # ── Scoring ────────────────────────────────────────────────────────────────────
-
-def _compute_score(title_a: str, title_b: str) -> Tuple[float, float, float]:
-    """
-    Return (final_score, token_sort_ratio, partial_ratio) — all in [0, 1].
-    final_score = 0.7 × token_sort_ratio + 0.3 × partial_ratio
-    """
-    a = _preprocess(title_a)
-    b = _preprocess(title_b)
-    tsr = fuzz.token_sort_ratio(a, b) / 100.0
-    pr = fuzz.partial_ratio(a, b) / 100.0
-    final = 0.7 * tsr + 0.3 * pr
-    return final, tsr, pr
+def _compute_score(a: str, b: str) -> Tuple[float, float, float]:
+    """Return (final, token_sort_ratio, partial_ratio), all in [0,1]."""
+    pa, pb = _preprocess(a), _preprocess(b)
+    tsr = fuzz.token_sort_ratio(pa, pb) / 100.0
+    pr = fuzz.partial_ratio(pa, pb) / 100.0
+    return 0.7 * tsr + 0.3 * pr, tsr, pr
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
-
 def initialise() -> None:
-    """Load cache from disk. Call once at bot startup."""
     with _cache_lock:
-        _load_cache()
+        if _cache_is_stale():
+            _load_cache()
 
 
 def find_match(
@@ -158,39 +151,30 @@ def find_match(
     candidates: List[Candidate],
 ) -> Optional[Match]:
     """
-    Find the best-matching external market for a Kalshi market.
+    Find best-matching external market. Returns None if below threshold.
 
-    Args:
-        kalshi_ticker:     Kalshi market ticker (e.g., "KXFED-26NOV-T5.25")
-        kalshi_title:      Human-readable title of the Kalshi market
-        kalshi_close_date: When the Kalshi market closes (UTC-aware or None)
-        candidates:        List of Candidate objects from one source
-
-    Returns:
-        Match object if a confident match is found; None otherwise.
-        Low-confidence matches (0.65–0.74) are logged but NOT returned.
+    Thread-safe. Lock is held only for in-memory reads/writes.
+    Disk I/O happens after the lock is released.
     """
+    # Refresh stale cache under lock
     with _cache_lock:
         if _cache_is_stale():
             _load_cache()
 
-    # Score all candidates
+    if not candidates:
+        return None
+
+    # Score all candidates (no lock needed — read-only)
     best_score = -1.0
     best_candidate: Optional[Candidate] = None
-    best_tsr = 0.0
-    best_pr = 0.0
+    best_tsr = best_pr = 0.0
 
     for candidate in candidates:
-        score, tsr, pr = _compute_score(kalshi_title, candidate.title)
-
         if not _dates_compatible(kalshi_close_date, candidate.close_date):
-            continue   # Date mismatch — hard reject regardless of text score
-
+            continue
+        score, tsr, pr = _compute_score(kalshi_title, candidate.title)
         if score > best_score:
-            best_score = score
-            best_candidate = candidate
-            best_tsr = tsr
-            best_pr = pr
+            best_score, best_candidate, best_tsr, best_pr = score, candidate, tsr, pr
 
     if best_candidate is None:
         return None
@@ -208,11 +192,9 @@ def find_match(
         )
         return None
 
-    # Below low-confidence floor: silent reject
     if best_score < config.FUZZY_LOW_CONF_MIN:
         return None
 
-    # Confident match (>= FUZZY_MATCH_THRESHOLD)
     match = Match(
         kalshi_title=kalshi_title,
         kalshi_ticker=kalshi_ticker,
@@ -223,43 +205,26 @@ def find_match(
         partial_ratio=best_pr,
     )
 
-    # Persist to cache
+    # Update cache in memory (fast, under lock), write disk outside lock
     key = _cache_key(kalshi_ticker, best_candidate.source)
     with _cache_lock:
         _cache[key] = asdict(match)
-        _save_cache()
+        snapshot = dict(_cache)  # Shallow copy for disk write
+
+    # Disk I/O outside lock — non-blocking for other threads
+    _save_cache_to_disk(snapshot)
 
     return match
 
 
-def find_matches_multi_source(
-    kalshi_ticker: str,
-    kalshi_title: str,
-    kalshi_close_date: Optional[datetime],
-    manifold_candidates: List[Candidate],
-    predictit_candidates: List[Candidate],
-) -> Dict[str, Optional[Match]]:
-    """
-    Run find_match against both Manifold and PredictIt candidate lists.
-
-    Returns:
-        {"manifold": Match|None, "predictit": Match|None}
-    """
-    manifold_match = find_match(
-        kalshi_ticker, kalshi_title, kalshi_close_date, manifold_candidates
-    )
-    predictit_match = find_match(
-        kalshi_ticker, kalshi_title, kalshi_close_date, predictit_candidates
-    )
-    return {"manifold": manifold_match, "predictit": predictit_match}
-
-
 def invalidate_cache() -> None:
-    """Force-clear the in-memory and on-disk cache."""
     global _cache, _cache_loaded_at
     with _cache_lock:
         _cache = {}
         _cache_loaded_at = None
-        path = config.MATCH_CACHE_FILE
-        if os.path.exists(path):
+    path = config.MATCH_CACHE_FILE
+    if os.path.exists(path):
+        try:
             os.remove(path)
+        except OSError:
+            pass

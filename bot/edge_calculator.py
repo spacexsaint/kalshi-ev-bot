@@ -1,40 +1,35 @@
 """
-edge_calculator.py — EV, Kelly, KL-uncertainty-adjusted edge logic.
+edge_calculator.py — EV, Kelly, fee-aware position sizing.
 
-═══════════════════════════════════════════════════════════════════
-AUDIT FINDINGS & IMPROVEMENTS (2026-04-08):
-═══════════════════════════════════════════════════════════════════
+AUDIT LOG (chronological):
+─────────────────────────────────────────────────────────────────────
+v1 (original): Kelly used ask; EV used ask — coherent but ask-biased.
 
-[BUG FIX] Midpoint pricing:
-  Original code evaluated edge using ASK price only (p = yes_ask).
-  This overstates the true cost of entry on limit orders.
-  Fix: compute edge using midpoint = (bid + ask) / 2 for fair value
-  comparison; execute at ask for fill certainty.
+v2 (2026-04-08): Kelly used MIDPOINT; EV used ASK — INCOHERENT BUG.
+  Wide spread (bid=0.50, ask=0.65, mid=0.575, w=0.60):
+  Kelly(mid=0.575) > 0, EV(ask=0.65) < 0 → contradictory signal.
 
-[IMPROVEMENT] KL-divergence uncertainty penalty (arXiv 2024, Meister):
-  When probability estimate w has high uncertainty (single source),
-  naïve Kelly over-bets. Apply a KL-based discount:
-    kelly_adjusted = kelly_raw × uncertainty_multiplier
-  where uncertainty_multiplier ∈ {0.50, 0.75, 1.00} for 1/2/3 sources.
-  This reduces ruin probability from 78% → <2% per Galekwa et al. 2026.
+v3 (2026-04-09, CURRENT): Kelly uses ASK; EV uses ASK — coherent.
+  Midpoint stored as market_price (display/logging only, never in math).
+  Fee circular dependency fixed: estimate fee before contract count, then
+  deduct from available budget so total_cost ≤ intended stake.
 
-[IMPROVEMENT] Time-decay edge discounting:
-  Markets near resolution face price convergence — the edge is consumed
-  by the market. Discount when hours_to_close < TIME_DECAY_THRESHOLD_HR.
-  Decay = linear interpolation from 1.0 (at threshold) to
-  TIME_DECAY_MIN_MULTIPLIER (at MIN_TIME_TO_CLOSE_HR).
+MATHEMATICAL BASIS:
+  Binary Kalshi contract: pay p (ask), receive $1 if YES (w prob), $0 if NO.
+  Optimal Kelly fraction (Meister 2024, arXiv:2412.14144):
+    f_yes = (w - p) / (1 - p)    [derivative of E[log wealth] = 0]
+    f_no  = ((1-w) - q) / (1 - q)
+  Both Kelly and EV MUST use the same price (exec_price = ask).
 
-[PRESERVED] Kelly formula for binary prediction markets:
-  For YES at price p: f_yes = (w - p) / (1 - p)
-  For NO  at price q: f_no  = ((1 - w) - q) / (1 - q)
-  Source: arXiv:2412.14144 (Meister 2024) — confirmed correct formula.
+FEE CORRECTION:
+  Old:  contracts = floor(stake / p); fee added on top → overrun up to ~$1
+  New:  contracts = floor((stake - fee_estimate) / p)
+  This ensures total_cost = contracts*p + fee ≤ stake (within 1 cent).
 
-EV CALCULATION (net of fees):
-  gross_ev = w × (1 - p) - (1 - w) × p    [YES]
-  fee      = fee_calculator.compute(p, contracts)
-  net_ev   = gross_ev - fee (per dollar of stake)
-  net_edge = net_ev / p
-  Proceed only if net_edge >= MIN_EDGE (5%).
+ADJUSTMENTS APPLIED (all multiplicative to Kelly fraction):
+  1. Quarter-Kelly   (KELLY_FRACTION = 0.25)
+  2. KL-uncertainty  (0.50 / 0.75 / 1.00 for 1/2/3+ sources)
+  3. Time-decay      (linear 1.0→0.60 from 24h to 2h before close)
 """
 
 from __future__ import annotations
@@ -50,354 +45,241 @@ from bot import fee_calculator
 @dataclass
 class EdgeResult:
     direction: Literal["YES", "NO", "NONE"]
-    gross_edge: float        # Gross edge (before fees), fraction of stake
-    net_edge: float          # Net edge (after fees), fraction of stake
-    kelly_fraction: float    # Raw Kelly fraction f (before uncertainty adjustment)
-    adjusted_kelly: float    # KL-uncertainty-adjusted Kelly fraction
-    stake_usd: float         # Dollar amount to bet (sized by Kelly + caps)
-    fair_prob: float         # w — external fair probability
-    market_price: float      # Midpoint price used for edge calc
-    exec_price: float        # Ask price used for actual order placement
-    fee_usd: float           # Estimated fee for the computed stake
-    gross_ev: float          # Gross expected value in dollars
-    net_ev: float            # Net expected value in dollars
-    time_decay_mult: float   # Time-decay multiplier applied (1.0 = no decay)
-    uncertainty_mult: float  # KL-uncertainty multiplier applied (1.0 = max confidence)
-    source_count: int        # Number of external sources that matched
+    gross_edge: float        # Fraction of stake before fees
+    net_edge: float          # Fraction of stake after fees
+    kelly_fraction: float    # Raw Kelly f (at exec price, before multipliers)
+    adjusted_kelly: float    # After KL-uncertainty + time-decay
+    stake_usd: float         # Intended budget (contracts*p + fee ≤ this)
+    contracts: int           # Whole contracts to buy
+    fair_prob: float         # w from external aggregation
+    market_price: float      # Midpoint (display only — NOT used in any math)
+    exec_price: float        # Ask price — used for ALL calculations
+    fee_usd: float           # Taker fee for this trade
+    gross_ev: float          # Total gross EV in dollars
+    net_ev: float            # Total net EV in dollars (after fee)
+    time_decay_mult: float
+    uncertainty_mult: float
+    source_count: int
 
 
 def _validate_probability(value: float, name: str) -> None:
     if not (0.0 < value < 1.0):
-        raise ValueError(
-            f"{name} must be strictly in (0, 1). Got: {value}"
-        )
+        raise ValueError(f"{name} must be strictly in (0, 1). Got: {value}")
 
 
 def compute_time_decay_multiplier(hours_to_close: Optional[float]) -> float:
-    """
-    Compute a time-decay multiplier for edge discounting.
-
-    Markets near resolution face price convergence — external probability
-    estimates have less predictive power as the event approaches because
-    Kalshi's own price has incorporated most available information.
-
-    Returns:
-        1.0 — no decay (far from close, or unknown)
-        Linear interpolation down to TIME_DECAY_MIN_MULTIPLIER at MIN_TIME_TO_CLOSE_HR
-    """
+    """Linear decay from 1.0 (at threshold) to MIN_MULTIPLIER (at floor)."""
     if hours_to_close is None or hours_to_close >= config.TIME_DECAY_THRESHOLD_HR:
         return 1.0
-
-    threshold = config.TIME_DECAY_THRESHOLD_HR
-    floor_hr = config.MIN_TIME_TO_CLOSE_HR
-    min_mult = config.TIME_DECAY_MIN_MULTIPLIER
-
-    # Linear interpolation: 1.0 at threshold, min_mult at floor_hr
-    # hours_to_close ∈ [floor_hr, threshold]
-    t = max(floor_hr, min(hours_to_close, threshold))
-    frac = (t - floor_hr) / max(threshold - floor_hr, 0.001)
-    return min_mult + frac * (1.0 - min_mult)
+    floor = float(config.MIN_TIME_TO_CLOSE_HR)
+    thr = config.TIME_DECAY_THRESHOLD_HR
+    mn = config.TIME_DECAY_MIN_MULTIPLIER
+    t = max(floor, min(hours_to_close, thr))
+    return mn + (t - floor) / max(thr - floor, 0.001) * (1.0 - mn)
 
 
 def compute_uncertainty_multiplier(source_count: int) -> float:
-    """
-    KL-divergence-based uncertainty penalty on Kelly fraction.
-
-    Source: Meister (arXiv:2412.14144, 2024); Galekwa et al. (IEEE ACCESS, 2026)
-    More sources → lower estimation variance → higher Kelly fraction justified.
-
-    Returns:
-        KELLY_FRACTION modifier in (0, 1].
-        This is applied BEFORE the main KELLY_FRACTION multiplication.
-    """
+    """KL-divergence uncertainty penalty (Meister 2024, Galekwa 2026)."""
     if source_count >= 3:
-        return config.KL_UNCERTAINTY_PENALTY_TRIPLE_SOURCE   # 1.0
+        return config.KL_UNCERTAINTY_PENALTY_TRIPLE_SOURCE
     if source_count == 2:
-        return config.KL_UNCERTAINTY_PENALTY_DUAL_SOURCE     # 0.75
-    return config.KL_UNCERTAINTY_PENALTY_SINGLE_SOURCE       # 0.50
+        return config.KL_UNCERTAINTY_PENALTY_DUAL_SOURCE
+    return config.KL_UNCERTAINTY_PENALTY_SINGLE_SOURCE
 
 
 def _compute_midpoint(bid: float, ask: float) -> float:
-    """
-    Midpoint price: (bid + ask) / 2.
-
-    [AUDIT FIX] Original code used ask price for edge calculation.
-    Using ask overstates the cost of entry for limit orders.
-    The midpoint is the unbiased estimate of true execution price.
-    """
-    if bid <= 0:
-        return ask  # No bid — use ask as fallback
-    return (bid + ask) / 2.0
+    """Display/logging only — never used in financial calculations."""
+    return (bid + ask) / 2.0 if bid > 0 else ask
 
 
 def _gross_ev_yes(w: float, p: float) -> float:
-    """Gross expected value per $1 staked on YES at price p."""
+    """EV per contract for YES at price p. Equals (w - p)."""
     return w * (1.0 - p) - (1.0 - w) * p
 
 
 def _gross_ev_no(w: float, q: float) -> float:
-    """Gross expected value per $1 staked on NO at price q."""
+    """EV per contract for NO at price q. Equals ((1-w) - q)."""
     return (1.0 - w) * (1.0 - q) - w * q
 
 
 def _kelly_yes(w: float, p: float) -> float:
-    """
-    Kelly fraction for YES.
-    f_yes = (w - p) / (1 - p)
-    Source: arXiv:2412.14144 (Meister 2024) — optimal for binary contracts paying $1.
-    """
+    """f_yes = (w - p)/(1 - p). Meister 2024 arXiv:2412.14144."""
     return (w - p) / (1.0 - p)
 
 
 def _kelly_no(w: float, q: float) -> float:
-    """
-    Kelly fraction for NO.
-    f_no = ((1 - w) - q) / (1 - q)
-    Source: arXiv:2412.14144 (Meister 2024).
-    """
+    """f_no = ((1-w) - q)/(1 - q). Meister 2024 arXiv:2412.14144."""
     return ((1.0 - w) - q) / (1.0 - q)
 
 
-def _size_stake(
-    kelly_f: float,
-    balance: float,
-    uncertainty_mult: float,
-    time_decay_mult: float,
-) -> float:
+def _solve_contracts_with_fee(
+    stake: float,
+    price: float,
+    ticker: str,
+    max_iter: int = 5,
+) -> tuple[int, float]:
     """
-    Apply Quarter-Kelly, KL-uncertainty penalty, time-decay, and position limits.
+    Solve for the largest contract count where contracts*price + fee ≤ stake.
 
-    Final stake = min(
-        KELLY_FRACTION × uncertainty_mult × time_decay_mult × kelly_f × balance,
-        MAX_BET_PCT × balance
-    )
-    Floored at MIN_BET_USD.
-    """
-    effective_fraction = (
-        config.KELLY_FRACTION
-        * uncertainty_mult
-        * time_decay_mult
-        * kelly_f
-    )
-    raw = effective_fraction * balance
-    capped = min(raw, config.MAX_BET_PCT * balance)
-    return max(capped, config.MIN_BET_USD)
-
-
-def _net_edge_yes(
-    w: float,
-    yes_bid: float,
-    yes_ask: float,
-    balance: float,
-    uncertainty_mult: float,
-    time_decay_mult: float,
-    ticker: str = "",
-) -> tuple[float, float, float, float, float, float, float, float]:
-    """
-    Compute net edge for a YES bet using midpoint pricing.
+    Uses iterative refinement to handle the fee circular dependency:
+      1. Estimate fee for floor(stake/price) contracts.
+      2. Reduce budget by fee, recompute contracts.
+      3. Repeat until stable (converges in 2-3 iterations).
 
     Returns:
-        (gross_edge, net_edge, kelly_f, adjusted_kelly, stake_usd,
-         fee_usd, net_ev, exec_price)
+        (num_contracts, actual_fee)
     """
-    # [AUDIT FIX] Use midpoint for edge calculation, ask for execution
-    mid = _compute_midpoint(yes_bid, yes_ask) if config.USE_MIDPOINT_FOR_EDGE_CALC else yes_ask
-    exec_price = yes_ask  # Always execute at ask to ensure fill
+    if price <= 0 or stake <= 0:
+        return 0, 0.0
 
-    kelly_f = _kelly_yes(w, mid)
-    if kelly_f <= 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, exec_price
+    n = max(1, math.floor(stake / price))
+    for _ in range(max_iter):
+        fee = fee_calculator.compute_taker_fee(price, n, ticker)
+        budget_after_fee = stake - fee
+        if budget_after_fee <= 0:
+            # Fee exceeds entire stake — bet only 1 contract
+            fee_1 = fee_calculator.compute_taker_fee(price, 1, ticker)
+            if 1 * price + fee_1 <= stake + 0.005:  # 0.5c tolerance
+                return 1, fee_1
+            return 0, 0.0
+        n_new = max(1, math.floor(budget_after_fee / price))
+        if n_new == n:
+            break
+        n = n_new
 
-    adjusted_kelly = kelly_f * uncertainty_mult * time_decay_mult
-    stake = _size_stake(kelly_f, balance, uncertainty_mult, time_decay_mult)
-
-    # Contracts sized against ask (actual execution price)
-    num_contracts = math.floor(stake / exec_price)
-    if num_contracts < 1:
-        num_contracts = 1
-
-    fee = fee_calculator.compute_taker_fee(exec_price, num_contracts, ticker)
-    gross_ev_per_contract = _gross_ev_yes(w, exec_price)
-    total_gross_ev = gross_ev_per_contract * num_contracts
-    total_net_ev = total_gross_ev - fee
-
-    gross_edge = gross_ev_per_contract / exec_price
-    net_edge = total_net_ev / (num_contracts * exec_price) if num_contracts > 0 else 0.0
-
-    return gross_edge, net_edge, kelly_f, adjusted_kelly, stake, fee, total_net_ev, exec_price
+    fee = fee_calculator.compute_taker_fee(price, n, ticker)
+    return n, fee
 
 
-def _net_edge_no(
+def _compute_side(
     w: float,
-    no_bid: float,
-    no_ask: float,
+    bid: float,
+    ask: float,
     balance: float,
     uncertainty_mult: float,
     time_decay_mult: float,
-    ticker: str = "",
-) -> tuple[float, float, float, float, float, float, float, float]:
+    ticker: str,
+    is_yes: bool,
+) -> tuple[float, float, float, float, int, float, float, float, float]:
     """
-    Compute net edge for a NO bet using midpoint pricing.
+    Compute all metrics for one side (YES or NO).
+
+    Both Kelly fraction and EV use exec_price (ask) — coherent pricing.
 
     Returns:
-        (gross_edge, net_edge, kelly_f, adjusted_kelly, stake_usd,
-         fee_usd, net_ev, exec_price)
+        (gross_edge, net_edge, kelly_f, adjusted_kelly, contracts,
+         fee_usd, net_ev, exec_price, midpoint)
     """
-    mid = _compute_midpoint(no_bid, no_ask) if config.USE_MIDPOINT_FOR_EDGE_CALC else no_ask
-    exec_price = no_ask
+    exec_price = ask
+    midpoint = _compute_midpoint(bid, ask)  # Display only
 
-    kelly_f = _kelly_no(w, mid)
+    # Kelly at exec price (same price used for EV)
+    kelly_f = _kelly_yes(w, exec_price) if is_yes else _kelly_no(w, exec_price)
     if kelly_f <= 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, exec_price
+        return 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, exec_price, midpoint
 
     adjusted_kelly = kelly_f * uncertainty_mult * time_decay_mult
-    stake = _size_stake(kelly_f, balance, uncertainty_mult, time_decay_mult)
+    raw_stake = config.KELLY_FRACTION * adjusted_kelly * balance
+    stake = min(raw_stake, config.MAX_BET_PCT * balance)
+    stake = max(stake, config.MIN_BET_USD)
 
-    num_contracts = math.floor(stake / exec_price)
-    if num_contracts < 1:
-        num_contracts = 1
+    # Fee-aware contract sizing (fixes circular dependency)
+    contracts, fee = _solve_contracts_with_fee(stake, exec_price, ticker)
+    if contracts < 1:
+        return 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, exec_price, midpoint
 
-    fee = fee_calculator.compute_taker_fee(exec_price, num_contracts, ticker)
-    gross_ev_per_contract = _gross_ev_no(w, exec_price)
-    total_gross_ev = gross_ev_per_contract * num_contracts
+    # EV at exec price (coherent with Kelly)
+    gev_per = _gross_ev_yes(w, exec_price) if is_yes else _gross_ev_no(w, exec_price)
+    total_gross_ev = gev_per * contracts
     total_net_ev = total_gross_ev - fee
 
-    gross_edge = gross_ev_per_contract / exec_price
-    net_edge = total_net_ev / (num_contracts * exec_price) if num_contracts > 0 else 0.0
+    gross_edge = gev_per / exec_price
+    net_edge = total_net_ev / (contracts * exec_price)
 
-    return gross_edge, net_edge, kelly_f, adjusted_kelly, stake, fee, total_net_ev, exec_price
+    return gross_edge, net_edge, kelly_f, adjusted_kelly, contracts, fee, total_net_ev, exec_price, midpoint
 
 
 def compute_edge(
-    w: float,             # Fair probability from external sources
-    p: float,             # YES ask price (decimal) — used for execution
-    q: float,             # NO ask price (decimal) — used for execution
-    balance: float,       # Current account balance in USD
-    ticker: str = "",     # For index-market fee detection
-    yes_bid: float = 0.0, # YES bid price (0 = unknown, skip midpoint)
-    no_bid: float = 0.0,  # NO bid price (0 = unknown, skip midpoint)
-    hours_to_close: Optional[float] = None,  # Hours until market resolution
-    source_count: int = 1,                   # Number of external sources matched
+    w: float,
+    p: float,
+    q: float,
+    balance: float,
+    ticker: str = "",
+    yes_bid: float = 0.0,
+    no_bid: float = 0.0,
+    hours_to_close: Optional[float] = None,
+    source_count: int = 1,
 ) -> EdgeResult:
     """
-    Compute the optimal betting direction and size.
+    Compute optimal bet direction and size.
 
-    Improvements over v1:
-    - Midpoint pricing for unbiased edge calculation
-    - KL-uncertainty adjustment for single/dual/triple source confidence
-    - Time-decay discounting for near-resolution markets
+    Pricing: ALL math (Kelly + EV) uses exec_price = ask.
+    Midpoint stored in market_price for display only.
 
     Args:
-        w:              Fair probability (0–1) from aggregated external sources.
-        p:              Kalshi YES ask price as decimal (execution price).
-        q:              Kalshi NO ask price as decimal (execution price).
-        balance:        Current USD balance for sizing.
-        ticker:         Market ticker (for INX/NASDAQ100 fee discount).
-        yes_bid:        YES bid price (0 if unknown — disables midpoint).
-        no_bid:         NO bid price (0 if unknown — disables midpoint).
-        hours_to_close: Hours until market closes (None if unknown).
-        source_count:   Number of independent external sources that matched.
-
-    Returns:
-        EdgeResult with direction="YES"|"NO"|"NONE" and all computed values.
-
-    Raises:
-        ValueError: if any probability is outside (0, 1).
+        w:              Fair probability (0–1).
+        p:              YES ask price (decimal, 0–1).
+        q:              NO ask price (decimal, 0–1).
+        balance:        Current USD balance.
+        ticker:         Market ticker (INX/NASDAQ100 fee detection).
+        yes_bid:        YES bid (midpoint display only).
+        no_bid:         NO bid (midpoint display only).
+        hours_to_close: For time-decay calculation.
+        source_count:   Number of sources matched (for KL penalty).
     """
     _validate_probability(w, "fair_prob (w)")
     _validate_probability(p, "yes_price (p)")
     _validate_probability(q, "no_price (q)")
 
-    # Compute adjustment multipliers
-    time_decay_mult = compute_time_decay_multiplier(hours_to_close)
-    uncertainty_mult = compute_uncertainty_multiplier(source_count)
+    td = compute_time_decay_multiplier(hours_to_close)
+    um = compute_uncertainty_multiplier(source_count)
 
-    _no_bet = EdgeResult(
-        direction="NONE",
-        gross_edge=0.0,
-        net_edge=0.0,
-        kelly_fraction=0.0,
-        adjusted_kelly=0.0,
-        stake_usd=0.0,
-        fair_prob=w,
-        market_price=_compute_midpoint(yes_bid, p) if yes_bid > 0 else p,
-        exec_price=p,
-        fee_usd=0.0,
-        gross_ev=0.0,
-        net_ev=0.0,
-        time_decay_mult=time_decay_mult,
-        uncertainty_mult=uncertainty_mult,
-        source_count=source_count,
-    )
+    def _no_bet(exec_p: float = p) -> EdgeResult:
+        return EdgeResult(
+            direction="NONE", gross_edge=0.0, net_edge=0.0,
+            kelly_fraction=0.0, adjusted_kelly=0.0, stake_usd=0.0,
+            contracts=0, fair_prob=w,
+            market_price=_compute_midpoint(yes_bid, p) if yes_bid > 0 else p,
+            exec_price=exec_p, fee_usd=0.0, gross_ev=0.0, net_ev=0.0,
+            time_decay_mult=td, uncertainty_mult=um, source_count=source_count,
+        )
 
     if balance <= 0:
-        return _no_bet
+        return _no_bet()
 
-    # Evaluate YES
-    yes_results = _net_edge_yes(
-        w, yes_bid, p, balance, uncertainty_mult, time_decay_mult, ticker
-    )
-    yes_gross, yes_net, yes_kelly, yes_adj_k, yes_stake, yes_fee, yes_ev, yes_exec = yes_results
-    yes_qualifies = yes_net >= config.MIN_EDGE
+    # YES side
+    y = _compute_side(w, yes_bid, p, balance, um, td, ticker, is_yes=True)
+    yg, yn, yk, ya, yc, yf, yev, yp, ymid = y
+    yes_ok = yn >= config.MIN_EDGE and yc >= 1
 
-    # Evaluate NO
-    no_results = _net_edge_no(
-        w, no_bid, q, balance, uncertainty_mult, time_decay_mult, ticker
-    )
-    no_gross, no_net, no_kelly, no_adj_k, no_stake, no_fee, no_ev, no_exec = no_results
-    no_qualifies = no_net >= config.MIN_EDGE
+    # NO side
+    n_ = _compute_side(w, no_bid, q, balance, um, td, ticker, is_yes=False)
+    ng, nn, nk, na, nc, nf, nev, np_, nmid = n_
+    no_ok = nn >= config.MIN_EDGE and nc >= 1
 
-    # No edge on either side
-    if not yes_qualifies and not no_qualifies:
-        return _no_bet
+    if not yes_ok and not no_ok:
+        return _no_bet()
 
-    # Both qualify → pick larger net edge
-    if yes_qualifies and no_qualifies:
-        if yes_net >= no_net:
-            return EdgeResult(
-                direction="YES",
-                gross_edge=yes_gross, net_edge=yes_net,
-                kelly_fraction=yes_kelly, adjusted_kelly=yes_adj_k,
-                stake_usd=yes_stake, fair_prob=w,
-                market_price=_compute_midpoint(yes_bid, p) if yes_bid > 0 else p,
-                exec_price=yes_exec, fee_usd=yes_fee,
-                gross_ev=yes_ev, net_ev=yes_ev,
-                time_decay_mult=time_decay_mult, uncertainty_mult=uncertainty_mult,
-                source_count=source_count,
-            )
+    def _yes_result() -> EdgeResult:
+        stake = yc * yp + yf
         return EdgeResult(
-            direction="NO",
-            gross_edge=no_gross, net_edge=no_net,
-            kelly_fraction=no_kelly, adjusted_kelly=no_adj_k,
-            stake_usd=no_stake, fair_prob=w,
-            market_price=_compute_midpoint(no_bid, q) if no_bid > 0 else q,
-            exec_price=no_exec, fee_usd=no_fee,
-            gross_ev=no_ev, net_ev=no_ev,
-            time_decay_mult=time_decay_mult, uncertainty_mult=uncertainty_mult,
-            source_count=source_count,
+            direction="YES", gross_edge=yg, net_edge=yn,
+            kelly_fraction=yk, adjusted_kelly=ya, stake_usd=stake,
+            contracts=yc, fair_prob=w, market_price=ymid, exec_price=yp,
+            fee_usd=yf, gross_ev=yg * yc * yp, net_ev=yev,
+            time_decay_mult=td, uncertainty_mult=um, source_count=source_count,
         )
 
-    if yes_qualifies:
+    def _no_result() -> EdgeResult:
+        stake = nc * np_ + nf
         return EdgeResult(
-            direction="YES",
-            gross_edge=yes_gross, net_edge=yes_net,
-            kelly_fraction=yes_kelly, adjusted_kelly=yes_adj_k,
-            stake_usd=yes_stake, fair_prob=w,
-            market_price=_compute_midpoint(yes_bid, p) if yes_bid > 0 else p,
-            exec_price=yes_exec, fee_usd=yes_fee,
-            gross_ev=yes_ev, net_ev=yes_ev,
-            time_decay_mult=time_decay_mult, uncertainty_mult=uncertainty_mult,
-            source_count=source_count,
+            direction="NO", gross_edge=ng, net_edge=nn,
+            kelly_fraction=nk, adjusted_kelly=na, stake_usd=stake,
+            contracts=nc, fair_prob=w, market_price=nmid, exec_price=np_,
+            fee_usd=nf, gross_ev=ng * nc * np_, net_ev=nev,
+            time_decay_mult=td, uncertainty_mult=um, source_count=source_count,
         )
 
-    return EdgeResult(
-        direction="NO",
-        gross_edge=no_gross, net_edge=no_net,
-        kelly_fraction=no_kelly, adjusted_kelly=no_adj_k,
-        stake_usd=no_stake, fair_prob=w,
-        market_price=_compute_midpoint(no_bid, q) if no_bid > 0 else q,
-        exec_price=no_exec, fee_usd=no_fee,
-        gross_ev=no_ev, net_ev=no_ev,
-        time_decay_mult=time_decay_mult, uncertainty_mult=uncertainty_mult,
-        source_count=source_count,
-    )
+    if yes_ok and no_ok:
+        return _yes_result() if yn >= nn else _no_result()
+    return _yes_result() if yes_ok else _no_result()

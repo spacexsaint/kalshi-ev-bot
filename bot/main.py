@@ -136,10 +136,14 @@ async def _manage_positions(client: KalshiClient, session: aiohttp.ClientSession
                     entry_decimal = entry_cents / 100.0
                     if result == "yes":
                         pnl = (1.0 - entry_decimal) * contracts if direction == "YES" else -entry_decimal * contracts
+                        resolved_yes = True
                     elif result == "no":
                         pnl = -entry_decimal * contracts if direction == "YES" else (1.0 - entry_decimal) * contracts
+                        resolved_yes = False
                     else:
                         pnl = 0.0
+                        resolved_yes = None  # Ambiguous/annulled
+
                     await executor.close_position(
                         position=pos,
                         current_bid_cents=100 if (result == direction.lower()) else 0,
@@ -148,11 +152,25 @@ async def _manage_positions(client: KalshiClient, session: aiohttp.ClientSession
                         client=client,
                         session=session,
                     )
+
+                    # Log Brier score for calibration tracking
+                    if resolved_yes is not None:
+                        fair_prob = pos.get("fair_prob_at_entry", 0.5)
+                        brier = (fair_prob - float(resolved_yes)) ** 2
+                        bot_logger.log_brier_score(
+                            ticker=ticker,
+                            market_title=pos.get("market_title", ticker),
+                            fair_prob_at_entry=fair_prob,
+                            sources=pos.get("sources", []),
+                            resolved_yes=resolved_yes,
+                            brier_score=brier,
+                        )
                 continue
 
             current_bid = ob.yes_bid if direction == "YES" else ob.no_bid
             current_bid_cents = int(current_bid * 100)
 
+            # Profit-take: bid moved +PROFIT_TAKE_CENTS in our favour
             if current_bid_cents >= entry_cents + config.PROFIT_TAKE_CENTS:
                 _log.info(
                     "Profit take on %s: entry=%dc, bid=%dc (+%dc)",
@@ -162,6 +180,22 @@ async def _manage_positions(client: KalshiClient, session: aiohttp.ClientSession
                     position=pos,
                     current_bid_cents=current_bid_cents,
                     reason="profit_take",
+                    client=client,
+                    session=session,
+                )
+                continue
+
+            # Stop-loss: bid dropped STOP_LOSS_CENTS against us
+            # Prevents holding a position to -100% when the market moves hard against us
+            if current_bid_cents <= entry_cents - config.STOP_LOSS_CENTS:
+                _log.info(
+                    "Stop-loss on %s: entry=%dc, bid=%dc (-%dc)",
+                    ticker, entry_cents, current_bid_cents, entry_cents - current_bid_cents,
+                )
+                await executor.close_position(
+                    position=pos,
+                    current_bid_cents=current_bid_cents,
+                    reason="stop_loss",
                     client=client,
                     session=session,
                 )
@@ -199,23 +233,24 @@ async def _evaluate_market(
     if spread > config.MAX_BID_ASK_SPREAD:
         return None
 
+    # Determine category BEFORE fair value fetch so weights are category-aware
+    category = risk_manager.get_position_category(title)
+    corr_mult, _ = risk_manager.get_correlation_stake_multiplier(title)
+    if corr_mult == 0.0:
+        _log.debug("Pre-flight correlation block: %s (category=%s)", ticker, category)
+        return None
+
     fv = await fair_value.get_fair_value(
         kalshi_ticker=ticker,
         kalshi_title=title,
         kalshi_close_date=close_dt,
         session=session,
+        category=category,  # Enables category-specific source weights
     )
     if fv is None:
         return None
 
     if ob.yes_ask <= 0 or ob.no_ask <= 0:
-        return None
-
-    # Get category for correlation check (pre-flight)
-    category = risk_manager.get_position_category(title)
-    corr_mult, _ = risk_manager.get_correlation_stake_multiplier(title)
-    if corr_mult == 0.0:
-        _log.debug("Pre-flight correlation block: %s (category=%s)", ticker, category)
         return None
 
     try:
@@ -242,7 +277,8 @@ async def _evaluate_market(
         "direction": result.direction,
         "price_cents": int(result.exec_price * 100),
         "mid_price_cents": int(result.market_price * 100),
-        "stake_usd": result.stake_usd,
+        "contracts": result.contracts,       # Pre-computed with fee deducted
+        "stake_usd": result.stake_usd,       # Actual cost = contracts*price + fee
         "net_edge": result.net_edge,
         "gross_edge": result.gross_edge,
         "kelly_fraction": result.kelly_fraction,
@@ -364,6 +400,7 @@ async def _scan_markets(client: KalshiClient, session: aiohttp.ClientSession) ->
             ticker=ticker,
             market_title=candidate["title"],
             direction=direction,
+            contracts=candidate["contracts"],       # Pre-computed, fee-aware
             stake_usd=candidate["stake_usd"],
             price_cents=fresh_price,
             mid_price_cents=fresh_mid,

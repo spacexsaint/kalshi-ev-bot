@@ -1,11 +1,12 @@
 """
-executor.py — Order placement, fill tracking, Discord alerts.
+executor.py — Order placement, fill tracking, retry logic, Discord alerts.
 
-AUDIT IMPROVEMENTS (2026-04-08):
-  - exec_price (ask) vs market_price (midpoint) now tracked separately
-  - Correlation stake multiplier applied from risk_manager
-  - state_manager.add_position() now receives full metadata
-  - Discord alerts include source_count, uncertainty_mult, time_decay_mult
+IMPORTANT: Edge calculator now pre-computes the exact contract count with
+fee already deducted (no overrun). Executor uses result.contracts directly
+instead of re-deriving from stake/price (which ignores fee).
+
+Paper mode: simulates immediate full fill, no API calls.
+Live mode: places limit order at ask, polls for fills, cancels on timeout.
 """
 
 from __future__ import annotations
@@ -30,20 +31,18 @@ from bot.kalshi_client import KalshiClient
 _log = logging.getLogger(__name__)
 
 
-# ── Discord alerting ───────────────────────────────────────────────────────────
-
+# ── Discord ────────────────────────────────────────────────────────────────────
 async def _send_discord(session: aiohttp.ClientSession, content: str) -> None:
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "")
     if not webhook_url:
         return
     try:
         async with session.post(
-            webhook_url,
-            json={"content": content},
+            webhook_url, json={"content": content},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             if resp.status not in (200, 204):
-                _log.warning("Discord webhook returned HTTP %d", resp.status)
+                _log.warning("Discord webhook HTTP %d", resp.status)
     except Exception as exc:
         _log.warning("Discord alert failed: %s", exc)
 
@@ -53,7 +52,6 @@ def _fmt_mode() -> str:
 
 
 # ── Fill result ────────────────────────────────────────────────────────────────
-
 @dataclass
 class FillResult:
     success: bool
@@ -65,13 +63,7 @@ class FillResult:
 
 async def _simulate_paper_fill(num_contracts: int, client_order_id: str) -> FillResult:
     await asyncio.sleep(0.05)
-    return FillResult(
-        success=True,
-        filled_contracts=float(num_contracts),
-        partial=False,
-        order_id=f"PAPER-{client_order_id[:8]}",
-        client_order_id=client_order_id,
-    )
+    return FillResult(True, float(num_contracts), False, f"PAPER-{client_order_id[:8]}", client_order_id)
 
 
 async def _execute_live_order(
@@ -82,44 +74,32 @@ async def _execute_live_order(
     num_contracts: int,
     client_order_id: str,
 ) -> FillResult:
-    order = await client.place_order(
-        ticker=ticker,
-        side=side,
-        price_cents=price_cents,
-        num_contracts=num_contracts,
-        client_order_id=client_order_id,
-    )
+    order = await client.place_order(ticker, side, price_cents, num_contracts, client_order_id)
     if order is None:
         return FillResult(False, 0.0, False, "", client_order_id)
 
     order_id = order.get("order_id", "")
-    _log.info("Order placed: %s (id=%s, contracts=%d @ %dc)", ticker, order_id, num_contracts, price_cents)
+    _log.info("Order placed: %s id=%s contracts=%d @ %dc", ticker, order_id, num_contracts, price_cents)
 
-    poll_interval = 3.0
     elapsed = 0.0
     filled_contracts = 0.0
+    poll_s = 3.0
 
     while elapsed < config.ORDER_FILL_TIMEOUT_S:
-        await asyncio.sleep(poll_interval)
-        elapsed += poll_interval
-
+        await asyncio.sleep(poll_s)
+        elapsed += poll_s
         status = await client.get_order_status(order_id)
         if status is None:
             continue
-
-        order_status = status.get("status", "")
+        s = status.get("status", "")
         try:
             filled_contracts = float(status.get("fill_count_fp", "0") or "0")
         except (TypeError, ValueError):
-            filled_contracts = 0.0
-
-        if order_status == "filled":
+            pass
+        if s == "filled":
             return FillResult(True, filled_contracts, False, order_id, client_order_id)
-        if order_status in ("canceled", "cancelled"):
-            return FillResult(
-                filled_contracts > 0, filled_contracts, filled_contracts > 0,
-                order_id, client_order_id,
-            )
+        if s in ("canceled", "cancelled"):
+            return FillResult(filled_contracts > 0, filled_contracts, filled_contracts > 0, order_id, client_order_id)
 
     # Timeout — cancel remainder
     _log.warning("Order %s timed out. Cancelling.", order_id)
@@ -136,16 +116,16 @@ async def _execute_live_order(
     return FillResult(True, filled_contracts, True, order_id, client_order_id)
 
 
-# ── Public entry-point ─────────────────────────────────────────────────────────
-
+# ── place_bet ──────────────────────────────────────────────────────────────────
 async def place_bet(
     *,
     ticker: str,
     market_title: str,
     direction: str,
-    stake_usd: float,
-    price_cents: int,          # Execution price (ask)
-    mid_price_cents: int,      # Midpoint (for tracking)
+    contracts: int,              # Pre-computed by edge_calculator (fee-aware)
+    stake_usd: float,            # Actual total cost = contracts*price + fee
+    price_cents: int,
+    mid_price_cents: int,
     fair_prob: float,
     gross_edge: float,
     net_edge: float,
@@ -160,73 +140,67 @@ async def place_bet(
     client: KalshiClient,
     session: aiohttp.ClientSession,
 ) -> bool:
-    price_decimal = price_cents / 100.0
+    """
+    Execute a bet. Uses pre-computed contracts from edge_calculator (fee-aware).
+    Applies correlation penalty to contracts (reduces count, not re-deriving from stake).
+    """
     side = direction.lower()
 
-    # Apply correlation stake penalty
+    # Correlation penalty — reduce contracts proportionally
     corr_mult, _ = risk_manager.get_correlation_stake_multiplier(market_title)
     if corr_mult == 0.0:
-        _log.info("Correlation block on %s (category=%s)", ticker, category)
+        _log.info("Correlation block: %s (category=%s)", ticker, category)
         return False
 
-    effective_stake = stake_usd * corr_mult
-    num_contracts = math.floor(effective_stake / price_decimal)
-
-    if num_contracts < 1:
-        _log.info(
-            "Stake too small for %s: $%.2f at %dc → 0 contracts. Skipping.",
-            ticker, effective_stake, price_cents,
-        )
+    # Apply correlation penalty to contract count
+    effective_contracts = math.floor(contracts * corr_mult)
+    if effective_contracts < 1:
+        _log.info("Post-correlation contracts < 1 for %s. Skipping.", ticker)
         return False
+
+    # Recalculate actual stake after correlation adjustment
+    price_decimal = price_cents / 100.0
+    from bot.fee_calculator import compute_taker_fee
+    actual_fee = compute_taker_fee(price_decimal, effective_contracts, ticker)
+    actual_stake = effective_contracts * price_decimal + actual_fee
 
     client_order_id = str(uuid.uuid4())
 
     _log.info(
-        "[%s] %s %s: %d contracts @ %dc (stake=$%.2f, mid=%dc, edge=%.1f%%, "
-        "uncertainty=%.0f%%, decay=%.0f%%, sources=%d)",
+        "[%s] %s %s: %d contracts @ %dc "
+        "(cost=$%.2f fee=$%.4f mid=%dc edge=%.1f%% unc=%.0f%% decay=%.0f%% src=%d)",
         "PAPER" if config.PAPER_MODE else "LIVE",
-        direction, ticker, num_contracts, price_cents,
-        effective_stake, mid_price_cents,
-        net_edge * 100, uncertainty_mult * 100, time_decay_mult * 100,
-        source_count,
+        direction, ticker, effective_contracts, price_cents,
+        actual_stake, actual_fee, mid_price_cents,
+        net_edge * 100, uncertainty_mult * 100, time_decay_mult * 100, source_count,
     )
 
     if config.PAPER_MODE:
-        fill = await _simulate_paper_fill(num_contracts, client_order_id)
+        fill = await _simulate_paper_fill(effective_contracts, client_order_id)
     else:
-        fill = await _execute_live_order(
-            client, ticker, side, price_cents, num_contracts, client_order_id
-        )
+        fill = await _execute_live_order(client, ticker, side, price_cents, effective_contracts, client_order_id)
 
     if not fill.success or fill.filled_contracts == 0:
         bot_logger.log_trade(
-            ticker=ticker,
-            market_title=market_title,
-            direction=direction,
-            entry_price_cents=price_cents,
-            contracts=float(num_contracts),
-            stake_usd=effective_stake,
-            fair_prob=fair_prob,
-            fair_prob_sources=fair_prob_sources,
-            gross_edge=gross_edge,
-            net_edge=net_edge,
-            fee_usd=fee_usd,
-            kelly_fraction=adjusted_kelly,
-            filled=False,
-            filled_contracts=0.0,
-            paper_mode=config.PAPER_MODE,
+            ticker=ticker, market_title=market_title, direction=direction,
+            entry_price_cents=price_cents, contracts=float(effective_contracts),
+            stake_usd=actual_stake, fair_prob=fair_prob,
+            fair_prob_sources=fair_prob_sources, gross_edge=gross_edge,
+            net_edge=net_edge, fee_usd=actual_fee, kelly_fraction=adjusted_kelly,
+            filled=False, filled_contracts=0.0, paper_mode=config.PAPER_MODE,
         )
         return False
 
-    actual_stake = fill.filled_contracts * price_decimal
+    # Compute actual fill cost
+    filled_fee = compute_taker_fee(price_decimal, int(fill.filled_contracts), ticker)
+    filled_cost = fill.filled_contracts * price_decimal + filled_fee
 
-    # Store position with full metadata
     state_manager.add_position(
         ticker=ticker,
         direction=direction,
         entry_price_cents=price_cents,
         contracts=fill.filled_contracts,
-        stake_usd=actual_stake,
+        stake_usd=filled_cost,
         fair_prob_at_entry=fair_prob,
         net_edge_at_entry=net_edge,
         client_order_id=client_order_id,
@@ -240,44 +214,34 @@ async def place_bet(
         uncertainty_mult=uncertainty_mult,
         time_decay_mult=time_decay_mult,
     )
-    risk_manager.record_fill(actual_stake)
+    risk_manager.record_fill(filled_cost)
 
     bot_logger.log_trade(
-        ticker=ticker,
-        market_title=market_title,
-        direction=direction,
-        entry_price_cents=price_cents,
-        contracts=float(num_contracts),
-        stake_usd=actual_stake,
-        fair_prob=fair_prob,
-        fair_prob_sources=fair_prob_sources,
-        gross_edge=gross_edge,
-        net_edge=net_edge,
-        fee_usd=fee_usd,
-        kelly_fraction=adjusted_kelly,
-        filled=True,
-        filled_contracts=fill.filled_contracts,
-        paper_mode=config.PAPER_MODE,
+        ticker=ticker, market_title=market_title, direction=direction,
+        entry_price_cents=price_cents, contracts=float(effective_contracts),
+        stake_usd=filled_cost, fair_prob=fair_prob,
+        fair_prob_sources=fair_prob_sources, gross_edge=gross_edge,
+        net_edge=net_edge, fee_usd=filled_fee, kelly_fraction=adjusted_kelly,
+        filled=True, filled_contracts=fill.filled_contracts, paper_mode=config.PAPER_MODE,
     )
 
     mode = _fmt_mode()
-    partial_note = " *(partial fill)*" if fill.partial else ""
-    corr_note = f" *(correlation penalty: {corr_mult:.0%})*" if corr_mult < 1.0 else ""
+    partial_note = " *(partial)*" if fill.partial else ""
+    corr_note = f" *(corr: {corr_mult:.0%})*" if corr_mult < 1.0 else ""
     alert = (
         f"🎯 **BET PLACED** {mode}{partial_note}{corr_note}\n"
-        f"Market: {market_title}\n"
-        f"Direction: **{direction}** at **{price_cents}¢** (mid: {mid_price_cents}¢)\n"
-        f"Stake: **${actual_stake:.2f}** | Contracts: **{fill.filled_contracts:.1f}**\n"
-        f"Fair Prob: **{fair_prob:.1%}** | Net Edge: **{net_edge:.1%}** | "
-        f"Gross: **{gross_edge:.1%}**\n"
-        f"Sources: {', '.join(fair_prob_sources)} ({source_count} matched)\n"
-        f"Uncertainty: {uncertainty_mult:.0%} | Decay: {time_decay_mult:.0%} | "
-        f"Category: {category}"
+        f"**{ticker}** — {market_title[:80]}\n"
+        f"**{direction}** @ **{price_cents}¢** (mid: {mid_price_cents}¢)\n"
+        f"Contracts: **{fill.filled_contracts:.0f}** | Cost: **${filled_cost:.2f}** | Fee: **${filled_fee:.4f}**\n"
+        f"Fair: **{fair_prob:.1%}** | Net Edge: **{net_edge:.1%}** | Gross: {gross_edge:.1%}\n"
+        f"Sources: {', '.join(fair_prob_sources)} | Category: {category}\n"
+        f"KL×Decay: {uncertainty_mult:.0%}×{time_decay_mult:.0%}"
     )
     await _send_discord(session, alert)
     return True
 
 
+# ── close_position ─────────────────────────────────────────────────────────────
 async def close_position(
     *,
     position: dict,
@@ -291,31 +255,26 @@ async def close_position(
     direction = position["direction"]
     entry_cents = position["entry_price_cents"]
     contracts = position["contracts"]
-    opened_at = position["opened_at"]
     client_order_id = position["client_order_id"]
+    opened_at = position.get("opened_at", "")
 
     if resolution_pnl is not None:
         pnl_usd = resolution_pnl
     else:
-        exit_decimal = current_bid_cents / 100.0
-        entry_decimal = entry_cents / 100.0
-        pnl_usd = (exit_decimal - entry_decimal) * contracts
+        pnl_usd = (current_bid_cents - entry_cents) / 100.0 * contracts
 
     try:
-        opened_dt = datetime.fromisoformat(opened_at)
-        held_s = (datetime.now(timezone.utc) - opened_dt).total_seconds()
+        held_s = (datetime.now(timezone.utc) - datetime.fromisoformat(opened_at)).total_seconds()
     except (ValueError, TypeError):
         held_s = 0.0
 
+    # Live sell order (only for non-resolution closes)
     if not config.PAPER_MODE and reason != "resolved":
-        import math
-        sell_side = "yes" if direction == "YES" else "no"
         sell_contracts = math.floor(contracts)
         if sell_contracts >= 1:
             await _execute_live_order(
-                client=client,
-                ticker=ticker,
-                side=sell_side,
+                client=client, ticker=ticker,
+                side="yes" if direction == "YES" else "no",
                 price_cents=current_bid_cents,
                 num_contracts=sell_contracts,
                 client_order_id=str(uuid.uuid4()),
@@ -325,26 +284,21 @@ async def close_position(
     risk_manager.record_pnl(pnl_usd)
 
     bot_logger.log_position_closed(
-        ticker=ticker,
-        market_title=position.get("market_title", ticker),
-        direction=direction,
-        entry_price_cents=entry_cents,
-        exit_price_cents=current_bid_cents,
-        contracts=contracts,
-        pnl_usd=pnl_usd,
-        held_seconds=held_s,
-        paper_mode=config.PAPER_MODE,
+        ticker=ticker, market_title=position.get("market_title", ticker),
+        direction=direction, entry_price_cents=entry_cents,
+        exit_price_cents=current_bid_cents, contracts=contracts,
+        pnl_usd=pnl_usd, held_seconds=held_s,
+        paper_mode=config.PAPER_MODE, reason=reason,
     )
 
     mode = _fmt_mode()
-    pnl_sign = "+" if pnl_usd >= 0 else ""
-    held_str = f"{held_s / 3600:.1f}h" if held_s >= 3600 else f"{held_s / 60:.0f}m"
+    held_str = f"{held_s/3600:.1f}h" if held_s >= 3600 else f"{held_s/60:.0f}m"
+    emoji = "✅" if pnl_usd >= 0 else "🔴"
+    reason_emoji = {"profit_take": "🎯", "stop_loss": "🛑", "resolved": "🏁"}.get(reason, "📋")
     alert = (
-        f"{'✅' if pnl_usd >= 0 else '🔴'} **CLOSED** {mode} — "
-        f"P&L: **{pnl_sign}${pnl_usd:.2f}**\n"
-        f"Market: {ticker} | Direction: {direction} | "
-        f"Held: {held_str} | Reason: {reason}\n"
+        f"{emoji} **CLOSED** {mode} {reason_emoji} {reason.upper()}\n"
+        f"**{ticker}** | {direction} | Held: {held_str}\n"
         f"Entry: {entry_cents}¢ → Exit: {current_bid_cents}¢ | "
-        f"Contracts: {contracts:.1f}"
+        f"Contracts: {contracts:.0f} | **P&L: {'+' if pnl_usd>=0 else ''}${pnl_usd:.2f}**"
     )
     await _send_discord(session, alert)
