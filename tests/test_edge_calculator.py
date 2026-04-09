@@ -90,6 +90,11 @@ class TestTimeDecay:
         expected = min_m + 0.5 * (1.0 - min_m)
         assert mult == pytest.approx(expected, abs=0.02)
 
+    def test_decay_above_threshold_no_decay(self):
+        """Above TIME_DECAY_THRESHOLD_HR, no decay should be applied."""
+        above = config.TIME_DECAY_THRESHOLD_HR + 1.0
+        assert compute_time_decay_multiplier(above) == pytest.approx(1.0)
+
     def test_decay_at_floor(self):
         """At MIN_TIME_TO_CLOSE_HR, apply maximum decay."""
         mult = compute_time_decay_multiplier(float(config.MIN_TIME_TO_CLOSE_HR))
@@ -97,10 +102,21 @@ class TestTimeDecay:
 
     def test_decay_reduces_stake(self):
         """Time decay should reduce effective stake compared to no decay."""
+        # Use hours within the decay range (below TIME_DECAY_THRESHOLD_HR=12h)
         result_near = compute_edge(w=0.70, p=0.55, q=0.48, balance=1000.0, hours_to_close=3.0)
         result_far = compute_edge(w=0.70, p=0.55, q=0.48, balance=1000.0, hours_to_close=48.0)
         if result_near.direction != "NONE" and result_far.direction != "NONE":
             assert result_near.stake_usd <= result_far.stake_usd
+
+    def test_decay_threshold_is_12h(self):
+        """Verify TIME_DECAY_THRESHOLD_HR is set to 12h for optimal convergence."""
+        # External sources update infrequently; Kalshi's own price converges
+        # to truth faster after 12h. Changed from 24h to 12h.
+        assert config.TIME_DECAY_THRESHOLD_HR == pytest.approx(12.0, abs=0.1)
+        # At 13h (above threshold): no decay
+        assert compute_time_decay_multiplier(13.0) == pytest.approx(1.0)
+        # At 7h (midpoint 12h-2h = 7h): significant decay applied
+        assert compute_time_decay_multiplier(7.0) < 1.0
 
 
 # ── Uncertainty multiplier (KL penalty) ───────────────────────────────────────

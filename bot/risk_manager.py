@@ -57,6 +57,10 @@ _CATEGORY_PATTERNS: Dict[str, List[str]] = {
     "mlb": ["mlb", "baseball", "world series"],
     "sp500": ["s&p", "sp500", "inx", "stock market"],
     "gdp": ["gdp", "recession", "growth"],
+    "tech": ["microsoft", "apple", "google", "amazon", "meta", "tesla", "nvidia", "semiconductor"],
+    "ai": ["artificial intelligence", "openai", "anthropic", "llm", "gpt", "chatgpt", "gemini"],
+    "science": ["climate", "temperature", "nasa", "spacex", "nuclear", "vaccine"],
+    "health": ["fda", "drug approval", "covid", "pandemic", "flu", "cancer"],
 }
 
 
