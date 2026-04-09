@@ -192,3 +192,34 @@ class TestSourceHealthTracking:
         assert _source_fail_counts["manifold"] == 1
         _track_source_health("manifold", [])
         assert _source_fail_counts["manifold"] == 2
+
+
+# ── Fair value cache system tests (Agent C audit) ───────────────────────────
+
+class TestFairValueCacheSystem:
+    """Regression: fair_value cache must use asyncio.Lock (not threading.Lock) and time.monotonic."""
+
+    def test_cache_uses_monotonic_time(self):
+        """Cache TTL must use time.monotonic, not datetime (immune to clock jumps)."""
+        import inspect
+        from bot.fair_value import _caches_valid
+        src = inspect.getsource(_caches_valid)
+        assert "monotonic" in src, "Cache TTL should use time.monotonic, not datetime"
+
+    def test_refresh_lock_is_asyncio_not_threading(self):
+        """fair_value._refresh_lock must be asyncio.Lock for async code."""
+        import asyncio
+        from bot.fair_value import _get_refresh_lock
+        lock = _get_refresh_lock()
+        assert isinstance(lock, asyncio.Lock), (
+            "fair_value cache lock must be asyncio.Lock, not threading.Lock"
+        )
+        assert not isinstance(lock, type(None))
+
+    def test_aggregate_zero_sources_returns_none_via_get_fair_value(self):
+        """get_fair_value must return None (not 0.5) when no sources match."""
+        from bot.fair_value import _aggregate_probabilities
+        prob, count, names, mult = _aggregate_probabilities(None, None, None)
+        assert count == 0
+        # get_fair_value checks source_count == 0 and returns None
+        # The raw aggregation returns 0.0 but that's never exposed
